@@ -1,0 +1,20 @@
+fastapi~=0.118.0
+uvicorn[standard]~=0.37.0
+
+SQLAlchemy~=2.0
+pymysql
+
+python-dotenv~=1.0
+passlib[bcrypt]~=1.7
+
+# Elige UNO para JWT (recomiendo PyJWT si ya usas utils.security con él)
+PyJWT~=2.8
+# python-jose[cryptography]  # <- quítalo si usas PyJWT
+
+pydantic>=2
+python-multipart
+
+mysql~=0.0.3
+mysql-connector-python~=9.4.0
+dependencies~=7.7.1
+db~=0.1.1

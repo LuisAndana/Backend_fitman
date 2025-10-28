@@ -1,5 +1,8 @@
 # dependencies.py
 from __future__ import annotations
+from fastapi import Depends, Header, HTTPException
+from sqlalchemy.orm import Session, defer
+import os, jwt
 
 from typing import Generator, Optional
 from fastapi import Depends, HTTPException, Request, status
@@ -9,7 +12,7 @@ import os
 from config.database import get_db
 from models.user import Usuario
 from config.database import SessionLocal
-from utils.security import decode_token
+from utils.security import decode_token, JWT_SECRET, JWT_ALG
 from models.user import Usuario
 
 
@@ -27,28 +30,36 @@ def get_db() -> Generator[Session, None, None]:
 SECRET = os.getenv("JWT_SECRET", "devsecret")
 ALGO = os.getenv("JWT_ALGO", "HS256")
 
-def get_current_user(request: Request, db: Session = Depends(get_db)) -> Usuario:
-    auth = request.headers.get("authorization")
-    if not auth or not auth.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Falta token")
+def get_current_user(
+    db: Session = Depends(get_db),
+    Authorization: str | None = Header(None),
+) -> Usuario:
+    if not Authorization or not Authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Falta header Authorization Bearer")
 
-    token = auth.split(" ", 1)[1].strip()
+    token = Authorization.split(" ", 1)[1].strip()
     try:
-        payload = jwt.decode(token, SECRET, algorithms=[ALGO])
-        sub = payload.get("sub")
-        if not sub:
-            raise HTTPException(status_code=401, detail="Token inválido")
-        uid = int(sub)
-    except JWTError:
-        raise HTTPException(status_code=401, detail="Token inválido/expirado")
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
         raise HTTPException(status_code=401, detail="Token inválido")
 
-    u = db.query(Usuario).filter(Usuario.id_usuario == uid).first()
-    if not u:
-        raise HTTPException(status_code=401, detail="Usuario no encontrado")
+    uid = payload.get("sub")
+    try:
+        uid = int(uid)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token inválido (sub)")
 
-    return u
+    # ⚠️ Evita mapear ENUM inválidos
+    user = (
+        db.query(Usuario)
+        .options(defer(Usuario.sexo))   # <— clave
+        .filter(Usuario.id_usuario == uid)
+        .first()
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    return user
 
     # 2) Decodificar y validar payload
     try:

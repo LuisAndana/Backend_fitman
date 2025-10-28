@@ -6,7 +6,7 @@ from datetime import datetime
 
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
-from sqlalchemy import String, DateTime, Text, JSON, Enum as SAEnum, Integer, Computed  # <-- Computed
+from sqlalchemy import String, DateTime, Text, JSON, Enum as SAEnum, Integer, Computed
 from sqlalchemy.dialects.mysql import DECIMAL as MyDECIMAL, TINYINT as MyTINYINT
 
 from config.database import Base
@@ -18,10 +18,18 @@ class RolEnum(str, enum.Enum):
     entrenador = "entrenador"
 
 
+# models/user.py
 class SexoEnum(str, enum.Enum):
     Masculino = "Masculino"
-    Femenino = "Femenino"
-    Otro = "Otro"
+    Femenino  = "Femenino"
+    Otro      = "Otro"
+
+# …
+sexo: Mapped[Optional["SexoEnum"]] = mapped_column(
+    SAEnum("Masculino", "Femenino", "Otro", name="sexoenum", native_enum=False),
+    nullable=True
+)
+
 
 
 class Usuario(Base):
@@ -33,12 +41,21 @@ class Usuario(Base):
     apellido: Mapped[str] = mapped_column(String(100), nullable=False)
     email:    Mapped[str] = mapped_column(String(150), unique=True, index=True, nullable=False)
     password: Mapped[str] = mapped_column(String(255), nullable=False)
-    rol:      Mapped["RolEnum"] = mapped_column(SAEnum("alumno", "entrenador", name="rolenum"), nullable=False)
+
+    # Usa el Enum de Python para que coincida con la BD
+    rol: Mapped[RolEnum] = mapped_column(
+        SAEnum(RolEnum, name="rolenum", native_enum=True, validate_strings=True),
+        nullable=False
+    )
 
     fecha_registro: Mapped[datetime] = mapped_column(DateTime, server_default=func.now(), nullable=False)
 
-    # Perfil
-    sexo:        Mapped[Optional["SexoEnum"]] = mapped_column(SAEnum("HOMBRE", "MUJER", "OTRO", name="sexoenum"), nullable=True)
+    # ⚠️ AQUI EL CAMBIO: usa "Masculino/Femenino/Otro"
+    sexo: Mapped[Optional[SexoEnum]] = mapped_column(
+        SAEnum(SexoEnum, name="sexoenum", native_enum=True, validate_strings=True),
+        nullable=True
+    )
+
     edad:        Mapped[Optional[int]]   = mapped_column(MyTINYINT(unsigned=True), nullable=True)
     peso_kg:     Mapped[Optional[float]] = mapped_column(MyDECIMAL(5, 2), nullable=True)
     estatura_cm: Mapped[Optional[float]] = mapped_column(MyDECIMAL(5, 2), nullable=True)
@@ -46,8 +63,6 @@ class Usuario(Base):
     enfermedades:Mapped[Optional[str]]   = mapped_column(Text, nullable=True)
     foto_url:    Mapped[Optional[str]]   = mapped_column(String(255), nullable=True)
 
-    # Columna generada VIRTUAL en MySQL. SQLAlchemy no la incluirá en INSERT/UPDATE.
-    # Usamos NULLIF para evitar división por cero.
     imc: Mapped[Optional[float]] = mapped_column(
         MyDECIMAL(5, 2),
         Computed("ROUND(peso_kg / POW(NULLIF(estatura_cm,0)/100, 2), 2)", persisted=False),

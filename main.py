@@ -1,21 +1,23 @@
 # main.py
-from fastapi import FastAPI, HTTPException, Depends, APIRouter
-from pydantic import BaseModel
+from fastapi import FastAPI, HTTPException, Depends, APIRouter, Header
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi import Header
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel
 
+from sqlalchemy.orm import Session, defer
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy import insert, select
+
+from utils.passwords import verify_password, hash_password
 from google.oauth2 import id_token
 from google.auth.transport.requests import Request
 
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError
-from sqlalchemy import insert, select  # <-- Core
-
 from config.database import get_db
-from models import Usuario
+from models.user import Usuario  # <- usa el modelo correcto
 
 import os, datetime, jwt
 
+# Routers (estos deben exportar objetos APIRouter)
 from routers import (
     usuarios_router,
     ejercicios_router,
@@ -23,8 +25,10 @@ from routers import (
     asignaciones_router,
 )
 
+# === Crear app ANTES de usarla ===
 app = FastAPI(title="FitCoach API", version="1.0.0")
 
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -38,70 +42,63 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "Accept", "X-Requested-With", "*"],
 )
 
+# Servir archivos estáticos /uploads
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
+# ================== Config / Auth helpers ==================
 CLIENT_ID    = "144363202163-juhhgsrj47dp46co5bevehtmrpo54h9n.apps.googleusercontent.com"
 JWT_SECRET   = os.getenv("JWT_SECRET", "cambia-esto-en-produccion")
 JWT_ALG      = "HS256"
 JWT_EXP_DAYS = 7
-
-# --- roles válidos que el usuario puede elegir (desde el front)
-VALID_ROLES = {"alumno", "entrenador"}
+VALID_ROLES  = {"alumno", "entrenador"}
 
 auth_router = APIRouter(prefix="/auth", tags=["Auth"])
 
 class GoogleCred(BaseModel):
     credential: str
-    rol: str | None = None  # "alumno" | "entrenador"
+    rol: str | None = None
 
-
-# --- util: rol como string (soporta Enum y str) ---
 def _role_str(obj) -> str:
     r = getattr(obj, "rol", obj)
-    if hasattr(r, "value"):  # Enum
+    if hasattr(r, "value"):
         r = r.value
     return (str(r) if r is not None else "alumno").lower()
 
-
 def make_token(user: Usuario) -> str:
     now = datetime.datetime.utcnow()
+    user_id = getattr(user, "id_usuario", None) or getattr(user, "id", None)
+    if not user_id:
+        raise HTTPException(status_code=500, detail="Usuario sin ID válido al generar token")
+
+    provider = getattr(user, "auth_provider", None) or "local"
     payload = {
-        "sub": str(getattr(user, "id_usuario", getattr(user, "id", ""))),
+        "sub": str(user_id),
         "email": getattr(user, "email", ""),
         "rol": _role_str(user),
-        "provider": getattr(user, "auth_provider", None) or "google",
+        "provider": provider,
         "iat": now,
         "exp": now + datetime.timedelta(days=JWT_EXP_DAYS),
     }
     return jwt.encode(payload, JWT_SECRET, algorithm=JWT_ALG)
 
-
-# ---- helper: insert Core sin 'imc' ni columnas computadas ----
 def _insert_user_core(db: Session, values: dict) -> Usuario:
     cols = list(Usuario.__table__.columns)
     model_cols = {c.name for c in cols}
     computed_cols = {c.name for c in cols if getattr(c, "computed", None) is not None}
-
-    forbidden = {"imc"} | computed_cols  # nunca tocar generadas
+    forbidden = {"imc"} | computed_cols
     clean = {k: v for k, v in values.items() if k in model_cols and v is not None and k not in forbidden}
-
     if not clean:
         raise HTTPException(status_code=500, detail="No hay columnas válidas para insertar")
-
-    print("[auth] CORE INSERT keys:", list(clean.keys()))
     res = db.execute(insert(Usuario.__table__).values(**clean))
     db.commit()
-
     new_id = getattr(res, "lastrowid", None) or getattr(res, "inserted_primary_key", [None])[0]
     return db.execute(select(Usuario).where(Usuario.id_usuario == new_id)).scalar_one()
-
 
 # ---------- utilidades de login ----------
 class LoginCred(BaseModel):
     email: str
     password: str
-
-def _check_password(stored: str | None, plain: str) -> bool:
-    """Comparación simple (texto plano). No usa bcrypt."""
-    return bool(stored) and str(stored) == plain
 
 def _normalize_rol_input(raw: str | None) -> str | None:
     if not raw:
@@ -114,12 +111,6 @@ def _normalize_rol_input(raw: str | None) -> str | None:
     return r
 
 def _coerce_role_value(raw: str | None):
-    """
-    Convierte el rol del payload al tipo que espera la columna:
-    - SAEnum(enum_class=Python Enum)  -> miembro Enum
-    - SAEnum(enums=[...])             -> string permitido
-    - Sin enum                        -> string normal validado
-    """
     norm = _normalize_rol_input(raw)
     col = Usuario.__table__.columns.get("rol")
     if col is None:
@@ -139,53 +130,52 @@ def _coerce_role_value(raw: str | None):
     if enums:
         if norm is None:
             raise HTTPException(status_code=422, detail="Debes seleccionar un rol.")
-        if norm in enums:
-            return norm
-        for e in enums:
-            if e.lower() == norm:
-                return e
+        if norm in enums or any(e.lower() == norm for e in enums):
+            return next(e for e in enums if e.lower() == norm) if norm not in enums else norm
         raise HTTPException(status_code=422, detail=f"Rol inválido. Permitidos: {', '.join(enums)}.")
-
     if norm not in VALID_ROLES:
         raise HTTPException(status_code=422, detail="Rol inválido. Usa 'alumno' o 'entrenador'.")
     return norm
 
-# ---------- SOLO-BLOQUEO SI NO HAY PASSWORD REAL ----------
 def _is_google_only(user: Usuario) -> bool:
-    """
-    True si la cuenta debe iniciar sólo con Google (no tiene contraseña real).
-    Si ya tiene contraseña real (no placeholder), permitimos login local.
-    """
     pwd = (getattr(user, "password", "") or "").strip()
     has_real_password = bool(pwd) and pwd.upper() not in {"GOOGLE", "GOOGLE_OAUTH_ONLY"}
     if has_real_password:
-        return False  # permitir login local
-
+        return False
     provider = getattr(user, "auth_provider", None)
-    has_sub = False
-    try:
-        has_sub = bool(getattr(user, "google_sub"))
-    except Exception:
-        pass
+    has_sub = bool(getattr(user, "google_sub", None))
     is_placeholder = pwd.upper() in {"GOOGLE", "GOOGLE_OAUTH_ONLY"}
-
     return (provider == "google") or has_sub or is_placeholder
 
 def _password_login_logic(payload: LoginCred, db: Session) -> dict:
     email = payload.email.strip().lower()
-    user = db.query(Usuario).filter(Usuario.email == email).first()
+    user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
-
-    # bloquear password-login solo si es "Google-only" (sin password real)
     if _is_google_only(user):
-        raise HTTPException(
-            status_code=400,
-            detail="Esta cuenta está vinculada a Google. Usa el botón 'Continuar con Google'."
-        )
+        raise HTTPException(status_code=400, detail="Esta cuenta está vinculada a Google. Usa 'Continuar con Google'.")
 
-    if not _check_password(getattr(user, "password", None), payload.password):
+    db_pwd = getattr(user, "password", "")
+    if isinstance(db_pwd, (bytes, bytearray)):
+        db_pwd = db_pwd.decode("utf-8", "ignore")
+    db_pwd = db_pwd.rstrip()
+
+    ok = verify_password(payload.password, db_pwd)
+    if not ok and db_pwd and db_pwd == payload.password.strip():
+        user.password = hash_password(payload.password.strip())
+        db.add(user)
+        db.commit()
+        ok = True
+    if not ok:
         raise HTTPException(status_code=401, detail="Contraseña incorrecta.")
+
+    if not getattr(user, "auth_provider", None):
+        try:
+            user.auth_provider = "local"
+            db.add(user)
+            db.commit()
+        except Exception:
+            pass
 
     token = make_token(user)
     resp_usuario = {
@@ -194,6 +184,7 @@ def _password_login_logic(payload: LoginCred, db: Session) -> dict:
         "apellido": getattr(user, "apellido", None) or getattr(user, "apellidos", "") or "",
         "email": user.email,
         "rol": _role_str(user),
+        "auth_provider": getattr(user, "auth_provider", "local"),
     }
     return {"ok": True, "token": token, "usuario": resp_usuario}
 
@@ -210,26 +201,33 @@ def _current_user(db: Session = Depends(get_db), Authorization: str | None = Hea
         user_id = int(user_id)
     except Exception:
         raise HTTPException(status_code=401, detail="Token inválido (sub)")
-    user = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
+    user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.id_usuario == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
     return user
-
-def _to_float(x):
-    try:
-        return float(x) if x is not None else None
-    except Exception:
-        return None
-
 
 @auth_router.post("/login")
 def auth_login(payload: LoginCred, db: Session = Depends(get_db)):
     return _password_login_logic(payload, db)
 
-@usuarios_router.post("/login")  # compat con tu front actual
+@usuarios_router.post("/login")  # compat
 def legacy_login(payload: LoginCred, db: Session = Depends(get_db)):
     return _password_login_logic(payload, db)
 
+@auth_router.post("/set_password")
+def set_password(new_password: str, u: Usuario = Depends(_current_user), db: Session = Depends(get_db)):
+    try:
+        try:
+            import bcrypt
+            hashed = bcrypt.hashpw(new_password.encode("utf-8"), bcrypt.gensalt()).decode("utf-8")
+        except Exception:
+            hashed = hash_password(new_password)
+        u.password = hashed
+        db.add(u)
+        db.commit()
+        return {"ok": True}
+    except Exception:
+        raise HTTPException(status_code=500, detail="No se pudo actualizar la contraseña")
 
 # ---------- Google Sign-In ----------
 @auth_router.post("/google_signin")
@@ -237,7 +235,7 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
     try:
         info = id_token.verify_oauth2_token(payload.credential, Request(), CLIENT_ID)
     except Exception:
-        raise HTTPException(status_code=401, detail="Invalid Google token")
+        raise HTTPException(status_code=401, detail="Token de Google inválido")
 
     sub     = info.get("sub")
     email   = info.get("email")
@@ -257,85 +255,65 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
     cols = set(Usuario.__table__.columns.keys())
     has  = lambda c: c in cols
 
-    # Buscar usuario por sub (si existe la col) o por email
-    user = db.query(Usuario).filter(Usuario.google_sub == sub).first() if has("google_sub") and sub else None
+    user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.google_sub == sub).first() if has("google_sub") and sub else None
     if not user:
-        user = db.query(Usuario).filter(Usuario.email == email).first()
+        user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.email == email).first()
 
     try:
         if user:
-            print("[auth] UPDATE existing user (ORM) id:", getattr(user, "id_usuario", None))
-
             if has("google_sub") and sub:
                 user.google_sub = sub
             if has("auth_provider"):
                 user.auth_provider = "google"
-
-            # Preferir foto_url; si no existe, usar avatar_url
             if picture:
                 if has("foto_url"):
                     user.foto_url = picture
                 elif has("avatar_url"):
                     user.avatar_url = picture
-
             if has("nombre"):
                 user.nombre = given or name
             elif has("nombres"):
                 user.nombres = given or name
-
             if has("apellido"):
                 user.apellido = family
             elif has("apellidos"):
                 user.apellidos = family
-
             if has("rol") and payload.rol:
                 user.rol = _coerce_role_value(payload.rol)
-
             if has("status"):
                 user.status = "ACTIVO"
-
-            # IMPORTANT: NO sobrescribir si ya tiene contraseña real.
-            # Solo ponemos placeholder si está vacío (para cumplir NOT NULL).
-            if has("password") and not getattr(user, "password", None):
-                user.password = "GOOGLE"
-
+            if has("password"):
+                pwd = getattr(user, "password", None)
+                if not pwd or str(pwd).strip() in {"", "GOOGLE", "GOOGLE_OAUTH_ONLY"}:
+                    user.password = "GOOGLE_OAUTH_ONLY"
             db.add(user)
             db.commit()
-            db.refresh(user)
         else:
-            # --- REGISTRO NUEVO: exigir rol ---
             role_value = None
             if has("rol"):
-                if payload.rol is None:
+                if not payload.rol:
                     raise HTTPException(status_code=422, detail="Debes seleccionar un rol válido: 'alumno' o 'entrenador'.")
                 role_value = _coerce_role_value(payload.rol)
-
             values = {
                 "email": email,
                 "rol": role_value if has("rol") else None,
                 "fecha_registro": datetime.datetime.utcnow() if has("fecha_registro") else None,
-                "password": ("GOOGLE" if has("password") else None),  # placeholder corto para Google-only
+                "password": "GOOGLE_OAUTH_ONLY" if has("password") else None,
                 "google_sub": sub if has("google_sub") else None,
                 "auth_provider": "google" if has("auth_provider") else None,
                 "status": "ACTIVO" if has("status") else None,
             }
-
             if picture and (has("foto_url") or has("avatar_url")):
                 values["foto_url" if has("foto_url") else "avatar_url"] = picture
-
             if has("nombre"):
                 values["nombre"] = given or name
             elif has("nombres"):
                 values["nombres"] = given or name
-
             if has("apellido"):
                 values["apellido"] = family
             elif has("apellidos"):
                 values["apellidos"] = family
-
-            print("[auth] CREATE new user via CORE")
             user = _insert_user_core(db, values)
-
     except IntegrityError as ie:
         db.rollback()
         raise HTTPException(status_code=409, detail="Conflicto de claves únicas (email/google_sub).") from ie
@@ -344,7 +322,6 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
         raise
     except Exception as e:
         db.rollback()
-        print("[google_signin][ERROR]", repr(e))
         raise HTTPException(status_code=500, detail="Error guardando usuario") from e
 
     token = make_token(user)
@@ -354,12 +331,26 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
         "apellido": getattr(user, "apellido", None) or getattr(user, "apellidos", "") or "",
         "email": user.email,
         "rol": _role_str(user),
+        "auth_provider": "google",
     }
     return {"ok": True, "token": token, "usuario": resp_usuario}
 
+def _to_float(value):
+    try:
+        if value is None or value == "":
+            return None
+        return float(value)
+    except (ValueError, TypeError):
+        return None
+
+def _sexo_db_to_app(v):
+    if v is None:
+        return None
+    m = {"HOMBRE": "Masculino", "MUJER": "Femenino", "OTRO": "Otro"}
+    return m.get(str(v), v)
+
 @usuarios_router.get("/me", tags=["Usuarios"])
 def usuarios_me(u: Usuario = Depends(_current_user)):
-    """Devuelve el perfil completo del usuario autenticado."""
     resp = {
         "id": getattr(u, "id_usuario", getattr(u, "id", None)),
         "nombre":   getattr(u, "nombre", None) or getattr(u, "nombres", "") or "",
@@ -367,11 +358,11 @@ def usuarios_me(u: Usuario = Depends(_current_user)):
         "email": u.email,
         "rol": _role_str(u),
         "foto_url": getattr(u, "foto_url", None) or getattr(u, "avatar_url", None),
-        "sexo": getattr(u, "sexo", None),
+        "sexo": _sexo_db_to_app(getattr(u, "sexo", None)),
         "edad": getattr(u, "edad", None),
         "peso_kg": _to_float(getattr(u, "peso_kg", None)),
         "estatura_cm": _to_float(getattr(u, "estatura_cm", None)),
-        "imc": _to_float(getattr(u, "imc", None)),  # columna generada
+        "imc": _to_float(getattr(u, "imc", None)),
         "problemas": getattr(u, "problemas", None),
         "enfermedades": getattr(u, "enfermedades", None),
         "perfil_historial": getattr(u, "perfil_historial", None),
@@ -380,19 +371,12 @@ def usuarios_me(u: Usuario = Depends(_current_user)):
     }
     return {"ok": True, "usuario": resp}
 
-
-# Routers
+# Incluir routers
 app.include_router(auth_router)
 app.include_router(usuarios_router, tags=["Usuarios"])
-app.include_router(ejercicios_router,  prefix="/api/ejercicios",    tags=["Ejercicios"])
-app.include_router(rutinas_router,     prefix="/api/rutinas",       tags=["Rutinas"])
-app.include_router(asignaciones_router,prefix="/api/asignaciones",  tags=["Asignaciones"])
-
-for r in app.routes:
-    try:
-        print("ROUTE:", r.path, r.methods)
-    except Exception:
-        pass
+app.include_router(ejercicios_router,  prefix="/api/ejercicios",   tags=["Ejercicios"])
+app.include_router(rutinas_router,     prefix="/api/rutinas",      tags=["Rutinas"])
+app.include_router(asignaciones_router,prefix="/api/asignaciones", tags=["Asignaciones"])
 
 if __name__ == "__main__":
     import uvicorn

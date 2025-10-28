@@ -1,3 +1,0 @@
-DATABASE_URL=mysql+pymysql://root:0405@127.0.0.1:3306/gym_rutinas?charset=utf8mb4
-JWT_SECRET=super-secreto
-JWT_ALG=HS256

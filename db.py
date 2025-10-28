@@ -1,30 +1,22 @@
-# db.py
+# db.py — solo conexión, sin JWT ni lógica al importar
+from __future__ import annotations
+
 import os
-import mysql.connector
 from dotenv import load_dotenv
+import mysql.connector
+from mysql.connector import MySQLConnection
+from mysql.connector.pooling import PooledMySQLConnection
+from mysql.connector.abstracts import MySQLConnectionAbstract
 
-from config.database import dotenv_path
-
+# Carga variables del .env (si existe)
 load_dotenv()
 
-# --- después de load_dotenv(...) ---
-from dotenv import dotenv_values
-
-DATABASE_URL = os.getenv("DATABASE_URL")
-
-# fallback por si la clave llega como \ufeffDATABASE_URL
-if not DATABASE_URL:
-    parsed = dotenv_values(dotenv_path) if 'dotenv_path' in globals() and dotenv_path else {}
-    DATABASE_URL = parsed.get("DATABASE_URL") or parsed.get("\ufeffDATABASE_URL")
-
-
-def get_connection():
-    cn = mysql.connector.connect(
+def get_connection() -> PooledMySQLConnection | MySQLConnection | MySQLConnectionAbstract:
+    return mysql.connector.connect(
         host=os.getenv("DB_HOST", "127.0.0.1"),
         port=int(os.getenv("DB_PORT", "3306")),
         user=os.getenv("DB_USER", "root"),
         password=os.getenv("DB_PASSWORD", "0405"),
         database=os.getenv("DB_NAME", "gym_rutinas"),
-        auth_plugin='mysql_native_password'
+        auth_plugin="mysql_native_password",
     )
-    return cn

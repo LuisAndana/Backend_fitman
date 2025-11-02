@@ -1,8 +1,12 @@
 # models/user.py
 from __future__ import annotations
-
+from sqlalchemy import Column, Integer, String, Float, Boolean, ForeignKey
+from sqlalchemy.dialects.mysql import JSON
+from sqlalchemy.orm import relationship
+from .database import Base
 from typing import Optional
 from datetime import datetime
+from .database import Base
 
 from sqlalchemy.orm import relationship, Mapped, mapped_column
 from sqlalchemy.sql import func
@@ -80,3 +84,26 @@ class Usuario(Base):
         foreign_keys="Rutina.creado_por_id",
         cascade="all, delete-orphan",
     )
+
+    class Trainer(Base):
+        __tablename__ = "entrenadores"
+
+        id = Column(Integer, primary_key=True, index=True)
+        usuario_id = Column(Integer, ForeignKey("usuarios.id"), nullable=True, index=True)
+
+        nombre = Column(String(150), nullable=False, index=True)
+        especialidad = Column(String(100), nullable=False, index=True)
+        rating = Column(Float, default=0, nullable=False)
+        precio_mensual = Column(Integer, default=0, nullable=False)
+        ciudad = Column(String(100), nullable=False, index=True)
+        pais = Column(String(5), nullable=True)
+        experiencia = Column(Integer, default=0, nullable=False)
+
+        modalidades = Column(JSON, nullable=False, default=[])  # ["Online","Presencial"]
+        etiquetas = Column(JSON, nullable=False, default=[])  # ["Fuerza","Técnica"]
+
+        foto_url = Column(String(500), nullable=True)
+        whatsapp = Column(String(20), nullable=True)
+        bio = Column(String(1000), nullable=True)
+
+        activo = Column(Boolean, default=True, nullable=False)

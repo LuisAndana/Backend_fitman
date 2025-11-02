@@ -1,145 +1,87 @@
 # routers/usuarios.py
 from __future__ import annotations
-import re
-import os, uuid, traceback, json
+import re, os, uuid, traceback, json
 from datetime import datetime
-from typing import Optional, List, Union
 from pathlib import Path
+from typing import Optional, List, Union, Literal
+from schemas.user import (
+    Modalidad, TrainerOut, TrainersFacets, TrainersResponse,
+    TrainerDetail, PerfilEntrenador
+)
 
 from fastapi import APIRouter, Depends, HTTPException, status, UploadFile, File, Body, Request
 from pydantic import BaseModel, EmailStr, Field, field_validator, ConfigDict, model_validator, AliasChoices, constr
-
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import update, select, insert, text
 
-# --- IMPORTS DE DEPENDENCIAS ---
+# Tipos del listado de entrenadores
+from schemas.user import Modalidad, TrainerOut, TrainersFacets, TrainersResponse
+
+# Dependencias
 try:
     from utils.dependencies import get_db, get_current_user  # type: ignore
 except Exception:
-    try:
-        from app.dependencies import get_db, get_current_user  # type: ignore
-    except Exception:
-        from utils.dependencies import get_db, get_current_user  # type: ignore
+    from utils.dependencies import get_db, get_current_user  # type: ignore
 
 from models.user import Usuario, RolEnum
 from utils.security import hash_password, verify_password, create_token
 
 router = APIRouter(prefix="/usuarios", tags=["usuarios"])
 
-# ====================== Política de contraseñas ======================
 MIN_PASSWORD_LEN = 10
 SPECIALS_RE = r"[!@#$%^&*()\-\_=+\[\]{};:,.<>/?\\|`~\"']"
 
-# ====================== Config Archivos =======================
 ALLOWED_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
-CONTENTTYPE_TO_EXT = {
-    "image/png": ".png",
-    "image/jpeg": ".jpg",
-    "image/jpg": ".jpg",
-    "image/webp": ".webp",
-    "image/gif": ".gif",
-}
-MAX_AVATAR_BYTES = 4 * 1024 * 1024  # 4 MB
+CONTENTTYPE_TO_EXT = {"image/png": ".png","image/jpeg": ".jpg","image/jpg": ".jpg","image/webp": ".webp","image/gif": ".gif"}
+MAX_AVATAR_BYTES = 4 * 1024 * 1024
 
-UPLOADS_DIR = os.path.join(os.getcwd(), "uploads")
-os.makedirs(UPLOADS_DIR, exist_ok=True)
+UPLOADS_DIR = os.path.join(os.getcwd(), "uploads"); os.makedirs(UPLOADS_DIR, exist_ok=True)
+PERFILES_DIR = Path(os.getcwd()) / "data" / "perfiles"; PERFILES_DIR.mkdir(parents=True, exist_ok=True)
 
-# JSON por usuario para el perfil de entrenador
-PERFILES_DIR = Path(os.getcwd()) / "data" / "perfiles"
-PERFILES_DIR.mkdir(parents=True, exist_ok=True)
+def _perfil_path(user_id: int) -> Path: return PERFILES_DIR / f"{user_id}.json"
 
-# ====================== Helpers ======================
-def _perfil_path(user_id: int) -> Path:
-    return PERFILES_DIR / f"{user_id}.json"
-
-# --- Mapeo sexo App <-> DB (actual: ENUM 'Masculino','Femenino','Otro') ---
 _SEXO_APP_TO_DB = {
-    # Masculino
-    "masculino": "Masculino", "hombre": "Masculino", "m": "Masculino", "male": "Masculino", "h": "Masculino",
-    # Femenino
-    "femenino": "Femenino", "mujer": "Femenino", "f": "Femenino", "female": "Femenino",
-    # Otro
-    "otro": "Otro", "x": "Otro", "nd": "Otro", "n/d": "Otro", "no binario": "Otro", "non-binary": "Otro",
-    # Fallback de BD antigua (por si quedó algo)
-    "hombre": "Masculino", "mujer": "Femenino", "hombre_old": "Masculino", "mujer_old": "Femenino",
+    "masculino":"Masculino","hombre":"Masculino","m":"Masculino","male":"Masculino","h":"Masculino",
+    "femenino":"Femenino","mujer":"Femenino","f":"Femenino","female":"Femenino",
+    "otro":"Otro","x":"Otro","nd":"Otro","n/d":"Otro","no binario":"Otro","non-binary":"Otro",
 }
-_SEXO_DB_TO_APP = {
-    "Masculino": "Masculino",
-    "Femenino": "Femenino",
-    "Otro": "Otro",
-    # Fallback si aún existen restos del esquema viejo
-    "HOMBRE": "Masculino",
-    "MUJER": "Femenino",
-    "OTRO": "Otro",
-}
+_SEXO_DB_TO_APP = {"Masculino":"Masculino","Femenino":"Femenino","Otro":"Otro","HOMBRE":"Masculino","MUJER":"Femenino","OTRO":"Otro"}
 
 def absolutize_url(request: Request, url: str | None) -> str | None:
-    if not url:
-        return None
+    if not url: return None
     s = str(url)
-    if s.startswith(("http://", "https://", "data:")):
-        return s
+    if s.startswith(("http://","https://","data:")): return s
     base = str(request.base_url).rstrip("/")
-    if s.startswith("/"):
-        return f"{base}{s}"
-    return f"{base}/{s}"
-
-ALLOWED_SEXO = {"Masculino", "Femenino", "Otro"}
+    return f"{base}{s if s.startswith('/') else '/'+s}"
 
 def sexo_app_to_db(v: str | None) -> str | None:
-    if v is None:
-        return None
+    if v is None: return None
     key = str(v).strip().lower()
-    if not key:
-        return None
+    if not key: return None
     mapped = _SEXO_APP_TO_DB.get(key)
     if not mapped:
         raise HTTPException(status_code=422, detail="sexo debe ser Masculino, Femenino u Otro")
     return mapped
 
 def sexo_db_to_app(v: str | None) -> str | None:
-    if v is None:
-        return None
+    if v is None: return None
     return _SEXO_DB_TO_APP.get(str(v), None)
 
 def normalize_for_db(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
+    if not raw: return None
     r = raw.strip().lower()
-    mapa = {
-        "alumno": "alumno",
-        "cliente": "alumno",
-        "user": "alumno",
-        "empleado": "alumno",
-        "entrenador": "entrenador",
-        "coach": "entrenador",
-        "trainer": "entrenador",
-    }
+    mapa = {"alumno":"alumno","cliente":"alumno","user":"alumno","empleado":"alumno","entrenador":"entrenador","coach":"entrenador","trainer":"entrenador"}
     return mapa.get(r)
 
 def normalize_for_app(raw: Optional[str]) -> Optional[str]:
-    if not raw:
-        return None
+    if not raw: return None
     r = raw.strip().lower()
-    if r == "alumno":
-        return "cliente"
-    if r == "entrenador":
-        return "entrenador"
-    return r
+    return "cliente" if r=="alumno" else r
 
 def db_to_app_role(db_value: Optional[RolEnum | str]) -> Optional[str]:
-    if db_value is None:
-        return None
-    if isinstance(db_value, RolEnum):
-        return normalize_for_app(db_value.value)
-    return normalize_for_app(str(db_value))
-
-def _enum_values_from_db() -> set[str]:
-    try:
-        return set(getattr(Usuario.__table__.c.rol.type, "enums", []) or [])
-    except Exception:
-        return set()
+    if db_value is None: return None
+    return normalize_for_app(db_value.value if isinstance(db_value, RolEnum) else str(db_value))
 
 def _insert_user_core(db: Session, values: dict) -> Usuario:
     cols = list(Usuario.__table__.columns)
@@ -149,73 +91,17 @@ def _insert_user_core(db: Session, values: dict) -> Usuario:
     clean = {k: v for k, v in values.items() if k in model_cols and v is not None and k not in forbidden}
     if not clean:
         raise HTTPException(status_code=500, detail="No hay columnas válidas para insertar")
-
     res = db.execute(insert(Usuario.__table__).values(**clean))
     db.commit()
     new_id = getattr(res, "lastrowid", None) or getattr(res, "inserted_primary_key", [None])[0]
     return db.execute(select(Usuario).where(Usuario.id_usuario == new_id)).scalar_one()
 
-def _enum_values_from_model() -> set[str]:
-    try:
-        return {e.value for e in RolEnum}
-    except Exception:
-        return set()
+    def _only_modalidades(mods: list[str]) -> list[Modalidad]:
+        allowed = {"Online", "Presencial"}
+        return [m for m in mods if m in allowed]
 
-def _normalize_alias(raw: str) -> str:
-    r = (raw or "").strip().lower()
-    alias = {"cliente": "alumno", "user": "alumno", "empleado": "alumno", "coach": "entrenador", "trainer": "entrenador"}
-    return alias.get(r, r)
 
-def _resolve_role(candidate_raw: str) -> tuple[str, "RolEnum"]:
-    if not candidate_raw:
-        raise HTTPException(status_code=422, detail="rol requerido")
-
-    norm = _normalize_alias(candidate_raw)
-    db_vals = _enum_values_from_db()
-    py_vals = _enum_values_from_model()
-    prefer = norm
-
-    if db_vals and prefer in db_vals:
-        db_str = prefer
-    elif db_vals:
-        swap = {"alumno": "cliente", "cliente": "alumno"}.get(prefer, prefer)
-        if swap in db_vals:
-            db_str = swap
-        else:
-            raise HTTPException(status_code=422, detail=f"rol inválido (permitidos: {', '.join(sorted(db_vals))})")
-    else:
-        db_str = prefer
-
-    try:
-        py_enum = RolEnum(prefer)
-    except Exception:
-        swap = {"alumno": "cliente", "cliente": "alumno"}.get(prefer, prefer)
-        try:
-            py_enum = RolEnum(swap)
-        except Exception:
-            if py_vals:
-                raise HTTPException(status_code=422, detail=f"rol no permitido por el modelo (permitidos: {', '.join(sorted(py_vals))})")
-            raise HTTPException(status_code=422, detail="rol no permitido por el modelo")
-
-    return db_str, py_enum
-
-def resolve_role_for_db(candidate_raw: Optional[str], allowed_roles: Optional[set[str]]) -> str:
-    if not candidate_raw:
-        raise HTTPException(status_code=422, detail="rol requerido")
-    base = candidate_raw.strip().lower()
-    alias = {"cliente": "alumno", "user": "alumno", "empleado": "alumno", "coach": "entrenador", "trainer": "entrenador"}
-    norm = alias.get(base, base)
-    if allowed_roles:
-        if norm in allowed_roles:
-            return norm
-        if norm == "alumno" and "cliente" in allowed_roles:
-            return "cliente"
-        if norm == "cliente" and "alumno" in allowed_roles:
-            return "alumno"
-        raise HTTPException(status_code=422, detail=f"rol inválido (permitidos: {', '.join(sorted(allowed_roles))})")
-    return norm
-
-# ====================== Schemas ======================
+# ===== Schemas =====
 class RegisterBody(BaseModel):
     name: Optional[str] = Field(None, alias="name")
     nombre: Optional[str] = Field(None, alias="nombre")
@@ -229,16 +115,11 @@ class RegisterBody(BaseModel):
     @field_validator("password")
     @classmethod
     def strong_password(cls, v: str) -> str:
-        if any(ch.isspace() for ch in v):
-            raise ValueError("La contraseña no puede contener espacios.")
-        if not re.search(r"[A-Z]", v):
-            raise ValueError("Debe incluir al menos una letra MAYÚSCULA.")
-        if not re.search(r"[a-z]", v):
-            raise ValueError("Debe incluir al menos una letra minúscula.")
-        if not re.search(r"\d", v):
-            raise ValueError("Debe incluir al menos un número.")
-        if not re.search(SPECIALS_RE, v):
-            raise ValueError("Debe incluir al menos un carácter especial.")
+        if any(ch.isspace() for ch in v): raise ValueError("La contraseña no puede contener espacios.")
+        if not re.search(r"[A-Z]", v):    raise ValueError("Debe incluir al menos una letra MAYÚSCULA.")
+        if not re.search(r"[a-z]", v):    raise ValueError("Debe incluir al menos una letra minúscula.")
+        if not re.search(r"\d", v):       raise ValueError("Debe incluir al menos un número.")
+        if not re.search(SPECIALS_RE, v): raise ValueError("Debe incluir al menos un carácter especial.")
         return v
 
     @model_validator(mode="after")
@@ -300,6 +181,7 @@ class PerfilOut(BaseModel):
     updated_at: Optional[str] = None
     model_config = ConfigDict(populate_by_name=True)
 
+
 class UpdatePerfilBody(BaseModel):
     nombre: Optional[str] = None
     apellido: Optional[str] = None
@@ -310,6 +192,8 @@ class UpdatePerfilBody(BaseModel):
     problemas: Optional[str] = None
     enfermedades: Optional[Union[List[str], str]] = None
     model_config = ConfigDict(populate_by_name=True, extra="ignore")
+
+
 
     @field_validator("edad")
     @classmethod
@@ -365,6 +249,12 @@ class PerfilEntrenador(BaseModel):
     diplomas: list[ItemDip]  = Field(default_factory=list)
     cursos: list[ItemCur]    = Field(default_factory=list)
     logros: list[ItemLog]    = Field(default_factory=list)
+
+class TrainerDetail(TrainerOut):
+    email: EmailStr | None = None
+    telefono: str | None = None
+    perfil: PerfilEntrenador | None = None
+
 
 # ====================== CREATE ======================
 def _create_user(db: Session, payload: RegisterBody) -> RegisterResponse:
@@ -860,3 +750,227 @@ def subir_evidencia_entrenador(
         out.write(file.file.read())
     rel_url = f"/uploads/{fname}"
     return {"url": absolutize_url(request, rel_url)}
+
+
+# ====================== LISTADO PÚBLICO DE ENTRENADORES ======================
+entrenadores_router = APIRouter(prefix="/entrenadores", tags=["entrenadores"])
+
+def _as_list(raw) -> list:
+    if raw is None:
+        return []
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    s = str(raw).strip()
+    if not s:
+        return []
+    try:
+        if s.startswith("[") or s.startswith("{"):
+            val = json.loads(s)
+            if isinstance(val, list):
+                return [str(x).strip() for x in val if str(x).strip()]
+    except Exception:
+        pass
+    return [x.strip() for x in s.split(",") if x.strip()]
+
+def _nombre_completo(u: Usuario) -> str:
+    n = getattr(u, "nombre", None) or getattr(u, "nombres", "") or ""
+    a = getattr(u, "apellido", None) or getattr(u, "apellidos", "") or ""
+    return f"{n} {a}".strip()
+
+def _rol_str(u: Usuario) -> str:
+    r = getattr(u, "rol", None)
+    if r is None:
+        return ""
+    return (r.value if hasattr(r, "value") else str(r)).strip().lower()
+
+def _only_modalidades(mods: list[str] | None) -> list[Modalidad]:
+    if not mods:
+        return []
+    allowed = {"Online", "Presencial"}
+    return [m for m in mods if isinstance(m, str) and m in allowed]
+
+@entrenadores_router.get("", response_model=TrainersResponse)
+def listar_entrenadores(
+    request: Request,
+    db: Session = Depends(get_db),
+    q: str | None = None,
+    especialidad: str | None = None,
+    modalidad: Modalidad | None = None,
+    ratingMin: float | None = None,
+    precioMax: int | None = None,
+    ciudad: str | None = None,
+    sort: Literal["relevance", "rating", "experience", "price_asc", "price_desc"] = "relevance",
+    page: int = 1,
+    pageSize: int = 12,
+):
+    if db is None:
+        raise HTTPException(status_code=500, detail="DB no inicializada")
+
+    usuarios: list[Usuario] = db.query(Usuario).all()
+    trainers: list[TrainerOut] = []
+
+    for u in usuarios:
+        if _rol_str(u) != "entrenador":
+            continue
+
+        _esp   = getattr(u, "especialidad", "") or ""
+        _mods  = _only_modalidades(_as_list(getattr(u, "modalidades", None)))
+        _tags  = _as_list(getattr(u, "etiquetas", None))
+        _city  = getattr(u, "ciudad", "") or ""
+        _pais  = getattr(u, "pais", None)
+        _price = int(getattr(u, "precio_mensual", 0) or getattr(u, "precio", 0) or 0)
+        _rate  = float(getattr(u, "rating", 0) or 0)
+        _exp   = int(getattr(u, "experiencia", 0) or 0)
+        _wa    = getattr(u, "whatsapp", None)
+
+        raw_foto = getattr(u, "foto_url", None) or getattr(u, "avatar_url", None)
+        foto_abs = absolutize_url(request, raw_foto)
+
+        bio_text = None
+        try:
+            path = _perfil_path(int(u.id_usuario))
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    prof = json.load(f)
+                    bio_text = prof.get("resumen") or None
+        except Exception:
+            bio_text = None
+
+        trainers.append(TrainerOut(
+            id=int(u.id_usuario),
+            nombre=_nombre_completo(u) or (getattr(u, "nombre", "") or ""),
+            especialidad=_esp,
+            rating=_rate,
+            precio_mensual=_price,
+            ciudad=_city,
+            pais=_pais,
+            experiencia=_exp,
+            modalidades=_mods,
+            etiquetas=_tags,
+            foto_url=foto_abs,
+            whatsapp=_wa,
+            bio=bio_text,
+        ))
+
+    # 2) Filtros en memoria
+    q_low = (q or "").strip().lower()
+    def passes(t: TrainerOut) -> bool:
+        if q_low:
+            blob = f"{t.nombre} {t.especialidad} {t.ciudad} {' '.join(t.etiquetas)}".lower()
+            if q_low not in blob:
+                return False
+        if especialidad and t.especialidad != especialidad:
+            return False
+        if ciudad and t.ciudad != ciudad:
+            return False
+        if modalidad and modalidad not in t.modalidades:
+            return False
+        if ratingMin is not None and t.rating < ratingMin:
+            return False
+        if precioMax is not None and t.precio_mensual > precioMax:
+            return False
+        return True
+
+    filtered = [t for t in trainers if passes(t)]
+
+    # 3) Orden
+    if sort == "rating":
+        filtered.sort(key=lambda x: x.rating, reverse=True)
+    elif sort == "experience":
+        filtered.sort(key=lambda x: x.experiencia, reverse=True)
+    elif sort == "price_asc":
+        filtered.sort(key=lambda x: x.precio_mensual)
+    elif sort == "price_desc":
+        filtered.sort(key=lambda x: x.precio_mensual, reverse=True)
+    else:
+        filtered.sort(key=lambda x: (x.rating * x.experiencia) / (x.precio_mensual + 1), reverse=True)
+
+    # 4) Facets
+    especialidades = sorted({t.especialidad for t in trainers if t.especialidad})
+    ciudades      = sorted({t.ciudad for t in trainers if t.ciudad})
+    mods_set      = set()
+    for t in trainers:
+        mods_set.update(t.modalidades or [])
+    precio_min = min((t.precio_mensual for t in trainers), default=None)
+    precio_max = max((t.precio_mensual for t in trainers), default=None)
+    rating_max = max((t.rating for t in trainers), default=None)
+
+    facets = TrainersFacets(
+        especialidades=especialidades,
+        ciudades=ciudades,
+        modalidades=sorted(list(mods_set)),
+        precioMin=precio_min,
+        precioMax=precio_max,
+        ratingMax=rating_max,
+    )
+
+    # 5) Paginación
+    total = len(filtered)
+    page     = max(1, page)
+    pageSize = max(1, min(pageSize, 50))
+    start = (page - 1) * pageSize
+    end   = start + pageSize
+    items = filtered[start:end]
+
+    return TrainersResponse(items=items, total=total, page=page, pageSize=pageSize, facets=facets)
+
+# ---- DETALLE (plano, no anidado) ----
+@entrenadores_router.get("/{trainer_id}", response_model=TrainerDetail)
+def detalle_entrenador(
+    trainer_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    if db is None:
+        raise HTTPException(status_code=500, detail="DB no inicializada")
+
+    u: Usuario | None = db.query(Usuario).filter(Usuario.id_usuario == trainer_id).first()
+    if not u:
+        raise HTTPException(status_code=404, detail="Entrenador no encontrado (id inválido)")
+    if _rol_str(u) != "entrenador":
+        raise HTTPException(status_code=404, detail="Entrenador no encontrado (rol ≠ entrenador)")
+
+    _esp   = getattr(u, "especialidad", "") or ""
+    _mods  = _only_modalidades(_as_list(getattr(u, "modalidades", None)))
+    _tags  = _as_list(getattr(u, "etiquetas", None))
+    _city  = getattr(u, "ciudad", "") or ""
+    _pais  = getattr(u, "pais", None)
+    _price = int(getattr(u, "precio_mensual", 0) or getattr(u, "precio", 0) or 0)
+    _rate  = float(getattr(u, "rating", 0) or 0)
+    _exp   = int(getattr(u, "experiencia", 0) or 0)
+    _wa    = getattr(u, "whatsapp", None)
+    _tel   = getattr(u, "telefono", None)
+
+    raw_foto = getattr(u, "foto_url", None) or getattr(u, "avatar_url", None)
+    foto_abs = absolutize_url(request, raw_foto)
+
+    perfil_json: PerfilEntrenador | None = None
+    bio_text = None
+    try:
+        path = _perfil_path(int(u.id_usuario))
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                perfil_json = PerfilEntrenador(**json.load(f))
+                bio_text = perfil_json.resumen or None
+    except Exception:
+        perfil_json = None
+        bio_text = None
+
+    return TrainerDetail(
+        id=int(u.id_usuario),
+        nombre=_nombre_completo(u) or (getattr(u, "nombre", "") or ""),
+        especialidad=_esp,
+        rating=_rate,
+        precio_mensual=_price,
+        ciudad=_city,
+        pais=_pais,
+        experiencia=_exp,
+        modalidades=_mods,
+        etiquetas=_tags,
+        foto_url=foto_abs,
+        whatsapp=_wa,
+        bio=bio_text,
+        email=getattr(u, "email", None),
+        telefono=_tel,
+        perfil=perfil_json,
+    )

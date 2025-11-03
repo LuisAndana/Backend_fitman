@@ -1,0 +1,42 @@
+{
+  "resumen": "graduado de hardvard de cortines, soy bueni pa todo",
+  "especialidad": "cardio",
+  "especialidades": [
+    "YOGA",
+    "PILATES"
+  ],
+  "experiencia": 22,
+  "certificaciones": "ISSA",
+  "modalidades": [
+    "Presencial"
+  ],
+  "ciudad": "Los Mochis",
+  "precio": 500.0,
+  "educacion": [
+    {
+      "titulo": "ingeniero en la uas",
+      "institucion": "UAS ",
+      "inicio": "2020",
+      "fin": "2026",
+      "descripcion": "bueno pa todo ",
+      "evidenciaUrl": null
+    }
+  ],
+  "diplomas": [],
+  "cursos": [
+    {
+      "titulo": "java developer",
+      "institucion": "UAS",
+      "fecha": "2020",
+      "evidenciaUrl": null
+    }
+  ],
+  "logros": [
+    {
+      "titulo": "mate al arsenio de un escupitajoi",
+      "anio": "2022",
+      "descripcion": "no hizo ni pio",
+      "evidenciaUrl": null
+    }
+  ]
+}

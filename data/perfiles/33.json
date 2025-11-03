@@ -1,0 +1,30 @@
+{
+  "resumen": "ME GUSTA EL TERRRARIA",
+  "educacion": [
+    {
+      "titulo": "AYUDA ME MUERO",
+      "institucion": "UAS",
+      "inicio": "2004",
+      "fin": "2007",
+      "descripcion": "ayuda herman",
+      "evidenciaUrl": "http://localhost:8000/uploads/evid_33_1498de17a70b43918dce80834dba816e.jpg"
+    }
+  ],
+  "diplomas": [],
+  "cursos": [
+    {
+      "titulo": "ARSINIOR DEVELOPER",
+      "institucion": "UAS",
+      "fecha": "2004",
+      "evidenciaUrl": "http://localhost:8000/uploads/evid_33_3b309621f58f4d0c862c5aaa38478677.jpg"
+    }
+  ],
+  "logros": [
+    {
+      "titulo": "ME GRADUE DE LA UAS",
+      "anio": "2010",
+      "descripcion": "LO LOGRE",
+      "evidenciaUrl": "http://localhost:8000/uploads/evid_33_fa67abbe70c54816b7d466d1e2aacfb0.jpg"
+    }
+  ]
+}

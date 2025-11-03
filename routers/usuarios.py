@@ -218,42 +218,44 @@ class UpdatePerfilBody(BaseModel):
 
 # ====== Esquemas Perfil Entrenador ======
 class ItemEdu(BaseModel):
-    titulo: str | None = None
-    institucion: str | None = None
-    inicio: str | None = None
-    fin: str | None = None
-    descripcion: str | None = None
-    evidenciaUrl: str | None = None
+    titulo: Optional[str] = None
+    institucion: Optional[str] = None
+    inicio: Optional[str] = None
+    fin: Optional[str] = None
+    descripcion: Optional[str] = None
+    evidenciaUrl: Optional[str] = None
 
 class ItemDip(BaseModel):
-    titulo: str | None = None
-    institucion: str | None = None
-    fecha: str | None = None
-    evidenciaUrl: str | None = None
+    titulo: Optional[str] = None
+    institucion: Optional[str] = None
+    fecha: Optional[str] = None
+    evidenciaUrl: Optional[str] = None
 
 class ItemCur(BaseModel):
-    titulo: str | None = None
-    institucion: str | None = None
-    fecha: str | None = None
-    evidenciaUrl: str | None = None
+    titulo: Optional[str] = None
+    institucion: Optional[str] = None
+    fecha: Optional[str] = None
+    evidenciaUrl: Optional[str] = None
 
 class ItemLog(BaseModel):
-    titulo: str | None = None
-    anio: str | None = None
-    descripcion: str | None = None
-    evidenciaUrl: str | None = None
+    titulo: Optional[str] = None
+    anio: Optional[str] = None
+    descripcion: Optional[str] = None
+    evidenciaUrl: Optional[str] = None
 
 class PerfilEntrenador(BaseModel):
     resumen: Optional[str] = ""
+    especialidad: Optional[str] = None
+    especialidades: list[str] = Field(default_factory=list)
+    experiencia: Optional[int] = None
+    certificaciones: Optional[str] = None
+    modalidades: list[str] = Field(default_factory=list)
+    ciudad: Optional[str] = None
+    precio: Optional[float] = None
     educacion: list[ItemEdu] = Field(default_factory=list)
     diplomas: list[ItemDip]  = Field(default_factory=list)
     cursos: list[ItemCur]    = Field(default_factory=list)
     logros: list[ItemLog]    = Field(default_factory=list)
-
-class TrainerDetail(TrainerOut):
-    email: EmailStr | None = None
-    telefono: str | None = None
-    perfil: PerfilEntrenador | None = None
 
 
 # ====================== CREATE ======================
@@ -720,37 +722,105 @@ def borrar_avatar_compat_delete(
 # ====== Perfil de Entrenador (/usuarios/entrenador/*) ======
 @router.get("/entrenador/perfil", response_model=PerfilEntrenador)
 def get_perfil_entrenador(current: Usuario = Depends(get_current_user)):
-    path = _perfil_path(int(current.id_usuario))
-    if path.exists():
-        with path.open("r", encoding="utf-8") as f:
-            return PerfilEntrenador(**json.load(f))
+    """Obtiene el perfil completo del entrenador actual"""
+    try:
+        path = _perfil_path(int(current.id_usuario))
+        if path.exists():
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+                return PerfilEntrenador(**data)
+    except Exception as e:
+        print(f"[get_perfil_entrenador] Error: {e}")
+
     return PerfilEntrenador()
+
 
 @router.put("/entrenador/perfil", response_model=PerfilEntrenador)
 def put_perfil_entrenador(
-    payload: PerfilEntrenador,
-    current: Usuario = Depends(get_current_user),
+        payload: PerfilEntrenador,
+        current: Usuario = Depends(get_current_user),
+        db: Session = Depends(get_db),
 ):
-    path = _perfil_path(int(current.id_usuario))
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", encoding="utf-8") as f:
-        json.dump(payload.dict(), f, ensure_ascii=False, indent=2)
-    return payload
+    """
+    Actualiza el perfil completo del entrenador
+    - Guarda en JSON (data/perfiles/{user_id}.json)
+    - Sincroniza con BD (tabla usuarios)
+    """
+    try:
+        # 1. Guardar en JSON
+        path = _perfil_path(int(current.id_usuario))
+        path.parent.mkdir(parents=True, exist_ok=True)
+
+        payload_dict = payload.dict(exclude_none=False)
+        with path.open("w", encoding="utf-8") as f:
+            json.dump(payload_dict, f, ensure_ascii=False, indent=2)
+
+        # 2. Actualizar también en la tabla usuarios
+        u = db.query(Usuario).filter(Usuario.id_usuario == current.id_usuario).first()
+        if u:
+            model_cols = set(Usuario.__table__.columns.keys())
+
+            if "especialidad" in model_cols:
+                u.especialidad = payload.especialidad
+            if "experiencia" in model_cols:
+                u.experiencia = payload.experiencia
+            if "certificaciones" in model_cols:
+                u.certificaciones = payload.certificaciones
+            if "modalidades" in model_cols:
+                u.modalidades = json.dumps(payload.modalidades or [], ensure_ascii=False)
+            if "ciudad" in model_cols:
+                u.ciudad = payload.ciudad
+            if "precio_sesion" in model_cols:
+                u.precio_sesion = payload.precio
+            if "updated_at" in model_cols:
+                u.updated_at = datetime.utcnow()
+
+            db.add(u)
+            db.commit()
+
+        return payload
+
+    except Exception as e:
+        db.rollback()
+        print(f"[put_perfil_entrenador] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
 
 @router.post("/entrenador/evidencia")
 def subir_evidencia_entrenador(
-    request: Request,
-    file: UploadFile = File(...),
-    current: Usuario = Depends(get_current_user),
+        request: Request,
+        file: UploadFile = File(...),
+        current: Usuario = Depends(get_current_user),
 ):
-    ext = os.path.splitext(file.filename or "")[1].lower() or ".pdf"
-    fname = f"evid_{current.id_usuario}_{uuid.uuid4().hex}{ext}"
-    fpath = os.path.join(UPLOADS_DIR, fname)
-    with open(fpath, "wb") as out:
-        out.write(file.file.read())
-    rel_url = f"/uploads/{fname}"
-    return {"url": absolutize_url(request, rel_url)}
+    """Sube archivos de evidencia (diploma, certificado, educación, etc.)"""
+    try:
+        allowed_types = {"application/pdf", "image/png", "image/jpeg", "image/jpg"}
+        content_type = (file.content_type or "").lower()
 
+        if content_type not in allowed_types:
+            raise HTTPException(status_code=400, detail="Tipo no permitido")
+
+        ext = os.path.splitext(file.filename or "")[1].lower() or ".pdf"
+        fname = f"evid_{current.id_usuario}_{uuid.uuid4().hex}{ext}"
+        fpath = os.path.join(UPLOADS_DIR, fname)
+
+        os.makedirs(UPLOADS_DIR, exist_ok=True)
+
+        data = file.file.read()
+        if len(data) > 10 * 1024 * 1024:
+            raise HTTPException(status_code=413, detail="Archivo muy grande")
+
+        with open(fpath, "wb") as out:
+            out.write(data)
+
+        rel_url = f"/uploads/{fname}"
+        return {"url": absolutize_url(request, rel_url), "success": True}
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[subir_evidencia] Error: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 # ====================== LISTADO PÚBLICO DE ENTRENADORES ======================
 entrenadores_router = APIRouter(prefix="/entrenadores", tags=["entrenadores"])
@@ -918,59 +988,226 @@ def listar_entrenadores(
 @entrenadores_router.get("/{trainer_id}", response_model=TrainerDetail)
 def detalle_entrenador(
     trainer_id: int,
-    request: Request,
-    db: Session = Depends(get_db),
+    request: Request,  # ← AGREGAR ESTE PARÁMETRO
+    db: Session = Depends(get_db)
 ):
-    if db is None:
-        raise HTTPException(status_code=500, detail="DB no inicializada")
-
-    u: Usuario | None = db.query(Usuario).filter(Usuario.id_usuario == trainer_id).first()
-    if not u:
-        raise HTTPException(status_code=404, detail="Entrenador no encontrado (id inválido)")
-    if _rol_str(u) != "entrenador":
-        raise HTTPException(status_code=404, detail="Entrenador no encontrado (rol ≠ entrenador)")
-
-    _esp   = getattr(u, "especialidad", "") or ""
-    _mods  = _only_modalidades(_as_list(getattr(u, "modalidades", None)))
-    _tags  = _as_list(getattr(u, "etiquetas", None))
-    _city  = getattr(u, "ciudad", "") or ""
-    _pais  = getattr(u, "pais", None)
-    _price = int(getattr(u, "precio_mensual", 0) or getattr(u, "precio", 0) or 0)
-    _rate  = float(getattr(u, "rating", 0) or 0)
-    _exp   = int(getattr(u, "experiencia", 0) or 0)
-    _wa    = getattr(u, "whatsapp", None)
-    _tel   = getattr(u, "telefono", None)
-
-    raw_foto = getattr(u, "foto_url", None) or getattr(u, "avatar_url", None)
-    foto_abs = absolutize_url(request, raw_foto)
-
-    perfil_json: PerfilEntrenador | None = None
-    bio_text = None
+    """Obtiene el detalle de un entrenador"""
     try:
-        path = _perfil_path(int(u.id_usuario))
-        if path.exists():
-            with path.open("r", encoding="utf-8") as f:
-                perfil_json = PerfilEntrenador(**json.load(f))
-                bio_text = perfil_json.resumen or None
-    except Exception:
-        perfil_json = None
-        bio_text = None
+        print(f"\n{'='*60}")
+        print(f"[DEBUG] Buscando entrenador con ID: {trainer_id}")
+        print(f"{'='*60}")
 
-    return TrainerDetail(
-        id=int(u.id_usuario),
-        nombre=_nombre_completo(u) or (getattr(u, "nombre", "") or ""),
-        especialidad=_esp,
-        rating=_rate,
-        precio_mensual=_price,
-        ciudad=_city,
-        pais=_pais,
-        experiencia=_exp,
-        modalidades=_mods,
-        etiquetas=_tags,
-        foto_url=foto_abs,
-        whatsapp=_wa,
-        bio=bio_text,
-        email=getattr(u, "email", None),
-        telefono=_tel,
-        perfil=perfil_json,
-    )
+        u = db.query(Usuario).filter(Usuario.id_usuario == trainer_id).first()
+
+        if not u:
+            print(f"[ERROR] Usuario {trainer_id} NO ENCONTRADO")
+            todos = db.query(Usuario.id_usuario, Usuario.nombre).all()
+            print(f"[DEBUG] Usuarios disponibles: {[(user.id_usuario, user.nombre) for user in todos]}")
+            raise HTTPException(status_code=404, detail=f"Entrenador con ID {trainer_id} no encontrado")
+
+        print(f"[OK] Usuario encontrado: {u.nombre}")
+
+        # Cargar perfil JSON
+        perfil_dict = None
+        try:
+            path = _perfil_path(trainer_id)
+            if path.exists():
+                with path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    perfil_json = PerfilEntrenador(**data)
+                    try:
+                        perfil_dict = perfil_json.model_dump()
+                    except AttributeError:
+                        perfil_dict = perfil_json.dict()
+        except Exception as e:
+            print(f"[WARN] Error cargando perfil JSON: {e}")
+
+        # Parsear modalidades
+        try:
+            modalidades = json.loads(u.modalidades) if u.modalidades else []
+        except:
+            modalidades = []
+
+        # Parsear etiquetas
+        try:
+            etiquetas = json.loads(u.etiquetas) if u.etiquetas else []
+        except:
+            etiquetas = []
+
+        # ✅ CONVERTIR FOTO A URL ABSOLUTA
+        raw_foto = getattr(u, "foto_url", None) or getattr(u, "avatar_url", None)
+        foto_absoluta = absolutize_url(request, raw_foto)
+
+        print(f"[DEBUG] Foto URL: {foto_absoluta}")
+        print(f"[DEBUG] Retornando TrainerDetail...")
+        print(f"{'='*60}\n")
+
+        return TrainerDetail(
+            id=int(u.id_usuario),
+            nombre=getattr(u, "nombre", "") or "",
+            especialidad=getattr(u, "especialidad", "") or "",
+            rating=float(getattr(u, "rating", 0) or 0),
+            precio_mensual=float(getattr(u, "precio_mensual", 0) or 0),
+            ciudad=getattr(u, "ciudad", "") or "",
+            pais=getattr(u, "pais", None),
+            experiencia=int(getattr(u, "experiencia", 0) or 0),
+            modalidades=modalidades,
+            etiquetas=etiquetas,
+            foto_url=foto_absoluta,  # ✅ USA URL ABSOLUTA
+            whatsapp=getattr(u, "whatsapp", None),
+            bio=getattr(u, "bio", None),
+            email=getattr(u, "email", ""),
+            telefono=getattr(u, "telefono", None),
+            perfil=perfil_dict,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ERROR] Exception: {type(e).__name__}: {e}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+# ============================================================
+# ENDPOINT DE DEBUG - LISTAR TODOS LOS USUARIOS
+# ============================================================
+
+@router.get("/debug/usuarios")
+def debug_usuarios(db: Session = Depends(get_db)):
+    """
+    ENDPOINT DE DEBUG - Muestra todos los usuarios disponibles
+    Úsalo para saber qué IDs existen en la BD
+    """
+    try:
+        # Obtener todos los usuarios
+        todos_usuarios = db.query(
+            Usuario.id_usuario,
+            Usuario.nombre,
+            Usuario.email,
+            Usuario.rol,
+            Usuario.especialidad,
+            Usuario.precio_sesion
+        ).all()
+
+        usuarios_lista = []
+        for u in todos_usuarios:
+            usuarios_lista.append({
+                "id": int(u.id_usuario),
+                "nombre": u.nombre or "Sin nombre",
+                "email": u.email or "Sin email",
+                "rol": u.rol or "Sin rol",
+                "especialidad": u.especialidad or "Sin especialidad",
+                "precio_sesion": u.precio_sesion or 0
+            })
+
+        print(f"\n[DEBUG] Total usuarios: {len(usuarios_lista)}")
+        for u in usuarios_lista:
+            print(f"  - ID: {u['id']}, Nombre: {u['nombre']}, Rol: {u['rol']}")
+
+        return {
+            "total": len(usuarios_lista),
+            "usuarios": usuarios_lista
+        }
+
+    except Exception as e:
+        print(f"[ERROR] Error en debug_usuarios: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ============================================================
+# ENDPOINT DE DEBUG - VER DETALLE DE UN USUARIO
+# ============================================================
+
+@router.get("/debug/usuarios/{user_id}")
+def debug_usuario_detalle(user_id: int, db: Session = Depends(get_db)):
+    """
+    ENDPOINT DE DEBUG - Muestra todos los datos de un usuario
+    """
+    try:
+        u = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
+
+        if not u:
+            return {
+                "error": f"Usuario {user_id} no encontrado",
+                "usuarios_disponibles": [
+                    int(usr.id_usuario) for usr in db.query(Usuario.id_usuario).all()
+                ]
+            }
+
+        return {
+            "id": int(u.id_usuario),
+            "nombre": u.nombre,
+            "email": u.email,
+            "rol": u.rol,
+            "especialidad": u.especialidad,
+            "experiencia": u.experiencia,
+            "precio_sesion": u.precio_sesion,
+            "ciudad": u.ciudad,
+            "pais": u.pais,
+            "rating": u.rating,
+            "foto_url": u.foto_url,
+            "whatsapp": u.whatsapp,
+            "bio": u.bio,
+            "etiquetas": u.etiquetas,
+            "modalidades": u.modalidades,
+        }
+
+    except Exception as e:
+        print(f"[ERROR] Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

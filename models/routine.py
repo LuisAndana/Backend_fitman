@@ -1,23 +1,22 @@
-from sqlalchemy.orm import relationship, Mapped, mapped_column
-from sqlalchemy import Integer, String, ForeignKey, DateTime
+# models/routine.py
+from sqlalchemy import Integer, String, ForeignKey, DateTime, Text
+from sqlalchemy.orm import Mapped, mapped_column, relationship
+from datetime import datetime
 from config.database import Base
+
 
 class Rutina(Base):
     __tablename__ = "rutinas"
 
     id_rutina: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    titulo: Mapped[str] = mapped_column(String(150))
-    # 👇 ESTA ES LA CLAVE: ForeignKey apunta a tabla.columna (no a Clase.atributo)
-    creado_por_id: Mapped[int] = mapped_column(
-        Integer,
-        ForeignKey("usuarios.id_usuario"),
-        nullable=False,
-        index=True,
-    )
-    creado_en: Mapped[DateTime] = mapped_column(DateTime)
+    id_entrenador: Mapped[int | None] = mapped_column(Integer, ForeignKey("usuarios.id_usuario"), nullable=True)
+    nombre: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    descripcion: Mapped[str | None] = mapped_column(Text, nullable=True)
+    objetivos: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    duracion_minutos: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    dificultad: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, nullable=False)
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, onupdate=datetime.utcnow, nullable=True)
 
-    creado_por = relationship(
-        "Usuario",
-        back_populates="rutinas_creadas",
-        foreign_keys=[creado_por_id],
-    )
+    # Relaciones - sin backrefs conflictivos
+    ejercicios = relationship("RutinaEjercicio", back_populates="rutina")

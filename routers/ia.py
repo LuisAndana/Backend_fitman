@@ -1,397 +1,954 @@
-# routers/ia.py
-from fastapi import APIRouter, Depends, HTTPException, status, File, UploadFile
+# routers/ia_router.py - Router IA V3 (Gemini primero + fallback local + filtros de salud)
+
+from fastapi import APIRouter, HTTPException, Depends
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
-from typing import List
-import base64
+from sqlalchemy import text
+from typing import List, Optional, Dict, Any, Literal
+import google.generativeai as genai
+import os
 import json
+import re
+from datetime import datetime
 
-from utils.dependencies import get_db, get_current_user
-from models.user import Usuario
-from models.analisis_usuario import AnalisisUsuario, Progreso
-from models.rutina_generada import RutinaGenerada
-from models.analisis_perfil import AnalisisPerfil
-from schemas.ia import (
-    GenerarRutinaRequest, RutinaGeneradaOut,
-    AnalisisPhotoRequest, AnalisisPhotoOut,
-    CalificacionEntrenadorRequest, CalificacionEntrenadorOut,
-    ProgresoOut
-)
-from services.ia_service import (
-    generar_rutina_con_ia,
-    analizar_foto_usuario_con_ia,
-    calificar_perfil_entrenador_con_ia,
-    analizar_perfil_usuario_con_ia
-)
+from utils.dependencies import get_db
 
-router = APIRouter(prefix="/ia", tags=["ia"])
+router = APIRouter(prefix="/api/ia", tags=["IA"])
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
+if GEMINI_API_KEY:
+    genai.configure(api_key=GEMINI_API_KEY)
+
+# ============================================================
+# SCHEMAS
+# ============================================================
+
+from enum import Enum
+
+class SexoEnum(str, Enum):
+    masculino = "masculino"
+    femenino = "femenino"
+    otro = "otro"
+
+class CondicionSalud(BaseModel):
+    nombre: str
+    severidad: Optional[str] = None  # leve|moderada|severa
+    controlada: Optional[bool] = True
+    notas: Optional[str] = None
+
+class Lesion(BaseModel):
+    zona: str
+    tipo: str
+    fase: Optional[str] = None
+    rango_mov_limitado: Optional[List[str]] = []
+    notas: Optional[str] = None
+
+class Medicacion(BaseModel):
+    nombre: str
+    dosis: Optional[str] = None
+    efectos_secundarios: Optional[List[str]] = []
+
+class PreferenciasUsuario(BaseModel):
+    equipamiento: List[str] = []
+    lugar: Optional[str] = "casa"
+    tiempo_minutos: Optional[int] = 45
+    dias_disponibles: Optional[int] = 4
+    experiencia: Optional[str] = "intermedio"
+    objetivos: List[str] = []
+    gustos: List[str] = []
+    disgustos: List[str] = []
+
+class DatosFisicos(BaseModel):
+    edad: Optional[int] = None
+    sexo: Optional[SexoEnum] = None
+    peso_kg: Optional[float] = None
+    estatura_cm: Optional[float] = None
+    grasa_corporal: Optional[float] = None
+    fc_reposo: Optional[int] = None
+
+class PerfilSalud(BaseModel):
+    usuario_id: Optional[int] = None
+    datos: DatosFisicos = DatosFisicos()
+    condiciones: List[CondicionSalud] = []
+    lesiones: List[Lesion] = []
+    medicaciones: List[Medicacion] = []
+    riesgos: List[str] = []
+    preferencias: PreferenciasUsuario = PreferenciasUsuario()
+
+class EjercicioRutina(BaseModel):
+    id_ejercicio: int
+    nombre: str
+    descripcion: str
+    grupo_muscular: str
+    dificultad: str
+    tipo: str
+    series: int
+    repeticiones: int
+    descanso_segundos: int
+    notas: Optional[str] = None
+
+class DiaRutinaDetallado(BaseModel):
+    numero_dia: int
+    nombre_dia: str
+    descripcion: str
+    grupos_enfoque: List[str]
+    ejercicios: List[EjercicioRutina]
+
+class RutinaCompleta(BaseModel):
+    nombre: str
+    descripcion: str
+    id_cliente: int
+    objetivo: str
+    grupo_muscular: str
+    nivel: str
+    dias_semana: int
+    total_ejercicios: int
+    minutos_aproximados: int
+    dias: List[DiaRutinaDetallado]
+    fecha_creacion: str
+    generada_por: str
+
+class SeguridadOut(BaseModel):
+    nivel_riesgo: str  # "bajo" | "moderado" | "alto"
+    detonantes_evitar: List[str] = []
+    advertencias: List[str] = []
+    validada_por_reglas: bool = False
+
+class SolicitudGenerarRutina(BaseModel):
+    id_cliente: int
+    objetivos: str
+    dias: int  # 2-7
+    nivel: str  # "principiante" | "intermedio" | "avanzado"
+    grupo_muscular_foco: Optional[str] = "general"
+    perfil_salud: Optional[PerfilSalud] = None
+    proveedor: Literal["auto", "gemini", "local"] = "auto"  # <-- NUEVO (con default)
+
+# ============================================================
+# PLANES (fallback local)
+# ============================================================
+
+PLANES_DISTRIBUCION = {
+    2: [["PECHO", "BRAZOS"], ["ESPALDA", "PIERNAS"]],
+    3: [["PECHO", "HOMBROS"], ["ESPALDA", "BRAZOS"], ["PIERNAS", "CORE"]],
+    4: [["PECHO", "TRÍCEPS"], ["ESPALDA", "BÍCEPS"], ["PIERNAS", "CORE"], ["HOMBROS", "CARDIO"]],
+    5: [["PECHO", "TRÍCEPS"], ["ESPALDA", "BÍCEPS"], ["PIERNAS"], ["HOMBROS"], ["CARDIO", "CORE"]],
+    6: [["PECHO"], ["ESPALDA"], ["BRAZOS"], ["PIERNAS"], ["HOMBROS"], ["CARDIO", "CORE"]],
+    7: [["PECHO"], ["ESPALDA"], ["BRAZOS"], ["PIERNAS"], ["HOMBROS"], ["CARDIO"], ["CORE", "DESCANSO"]],
+}
+
+MAPEO_GRUPOS_SECUNDARIOS = {
+    "TRÍCEPS": "BRAZOS",
+    "BÍCEPS": "BRAZOS",
+    "ANTEBRAZO": "BRAZOS",
+    "GEMELOS": "PIERNAS",
+    "CUÁDRICEPS": "PIERNAS",
+    "ISQUIOTIBIALES": "PIERNAS",
+    "ADUCTORES": "PIERNAS",
+    "GLÚTEOS": "PIERNAS",
+}
+
+# ============================================================
+# REGLAS DE SEGURIDAD
+# ============================================================
+
+CONTRAINDICACIONES = {
+    "hipertensión": {
+        "evitar_tags": ["valsalva", "isometria_larga", "hiit_alto_impacto", "cargas_maximas"],
+        "advertencias": ["Evitar maniobra de Valsalva y picos de intensidad altos."]
+    },
+    "lumbalgia crónica": {
+        "evitar_tags": ["carga_compresiva_lumbar_alta", "hiperextension_lumbar", "rotacion_lumbar"],
+        "advertencias": ["Preferir neutro lumbar y anti-rotación."]
+    },
+    "lesion_hombro": {
+        "evitar_tags": ["press_por_encima", "abduccion_90_mas", "rotacion_externa_cargada"],
+        "advertencias": ["Limitar ROM doloroso y cargas overhead."]
+    },
+    "diabetes tipo 2": {
+        "evitar_tags": [],
+        "advertencias": ["Control glucemia y snack si sesión >60 min."]
+    },
+
+}
+# Prioridad para glúteos (coincidencias por nombre/desc)
+PRIORIDAD_GLUTEOS = [
+    "hip thrust", "empuje de cadera", "puente de glúteo", "glute bridge",
+    "peso muerto rumano", "pmr", "romano", "rdl",
+    "sentadilla sumo", "sumo", "sentadilla", "squat",
+    "zancadas", "estocadas", "lunge", "bulgara", "búlgaras",
+    "step up", "subida al banco",
+    "abduccion", "abducción", "patada", "kickback", "monster walk", "frog pump"
+]
+
+# Equipamiento que NO debes usar "en casa" si no hay equipo declarado
+PALABRAS_MAQUINAS_GYM = ["máquina", "prensa", "polea", "cable", "smith", "hack", "leg press", "prensa 45"]
+PALABRAS_BARRA = ["barra", "barbell"]
+
+# === Selector de modelo robusto para Google Generative AI ===
+PREFERRED_MODELS = [
+    "models/gemini-2.5-flash",
+    "models/gemini-2.5-pro",
+    "models/gemini-1.5-flash-002",
+    "models/gemini-1.5-pro-002"
+]
+FALLBACK_LIGHT_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "models/gemini-2.5-flash")
+
+def _is_quota_error(err: Exception) -> bool:
+    msg = f"{type(err).__name__}: {err}"
+    m = msg.lower()
+    return (
+        "resourceexhausted" in m or
+        "quota" in m or
+        ("rate" in m and "limit" in m) or
+        "429" in m or
+        "generativelanguage.googleapis.com" in m
+    )
 
 
-@router.post("/generar-rutina", response_model=dict, status_code=status.HTTP_201_CREATED)
-def generar_rutina_endpoint(
-        payload: GenerarRutinaRequest,
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Genera una rutina personalizada con IA basada en el perfil del usuario"""
-
-    usuario = db.query(Usuario).filter(Usuario.id_usuario == current.id_usuario).first()
-    if not usuario:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
-    perfil_cliente = {
-        "nombre": f"{usuario.nombre} {usuario.apellido}",
-        "edad": usuario.edad,
-        "peso_kg": usuario.peso_kg,
-        "estatura_cm": usuario.estatura_cm,
-        "problemas": usuario.problemas,
-        "enfermedades": usuario.enfermedades if isinstance(usuario.enfermedades, list) else [],
-        "objetivo": payload.objetivo,
-    }
-
-    resultado = generar_rutina_con_ia(perfil_cliente)
-
-    if not resultado.get("success"):
-        raise HTTPException(status_code=500, detail=resultado.get("error"))
-
-    rutina_data = resultado.get("rutina")
-
+def _supports_generate_content(m) -> bool:
     try:
-        rutina = RutinaGenerada(
-            id_usuario=current.id_usuario,
-            nombre=rutina_data.get("nombre_rutina", "Rutina sin nombre"),
-            descripcion=rutina_data.get("descripcion", ""),
-            duracion_minutos=rutina_data.get("duracion_minutos", 60),
-            dificultad=rutina_data.get("dificultad", "Intermedio"),
-            ejercicios=json.dumps(rutina_data.get("ejercicios", [])),
-            prompt_usado=str(perfil_cliente),
-            modelo_ia="gemini-2.0-flash"
-        )
-        db.add(rutina)
-        db.commit()
-        db.refresh(rutina)
+        methods = getattr(m, "supported_generation_methods", []) or getattr(m, "generation_methods", [])
+        return "generateContent" in methods or "generate_content" in methods
+    except Exception:
+        return False
 
-        return {
-            "success": True,
-            "id_rutina_generada": rutina.id_rutina_generada,
-            "rutina": rutina_data,
-            "mensaje": "Rutina generada y guardada exitosamente en BD",
-            "modelo": "gemini-2.0-flash"
-        }
+def _normalize_model_name(name: str) -> str:
+    # El SDK lista modelos como "models/gemini-1.5-pro-002". Aceptamos ambos.
+    return name.split("/")[-1] if name and "/" in name else name
+
+def _select_gemini_model() -> str:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY no configurada")
+
+    wanted = os.getenv("GEMINI_MODEL", "").strip()
+    try:
+        models = list(genai.list_models())
     except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error guardando rutina: {str(e)}")
+        # Si no podemos listar, usa el que pidieron o el preferido por defecto
+        return wanted or PREFERRED_MODELS[0]
+
+    # Si pidieron uno concreto, valídalo contra la lista
+    if wanted:
+        for m in models:
+            m_id = _normalize_model_name(getattr(m, "name", ""))
+            if m_id == _normalize_model_name(wanted) and _supports_generate_content(m):
+                return m_id
+
+    # Si no hay/valido, usa el primero de los preferidos que esté disponible
+    for pref in PREFERRED_MODELS:
+        for m in models:
+            m_id = _normalize_model_name(getattr(m, "name", ""))
+            if m_id == pref and _supports_generate_content(m):
+                return pref
+
+    # Último recurso: el primer modelo que soporte generateContent
+    for m in models:
+        if _supports_generate_content(m):
+            return _normalize_model_name(getattr(m, "name", ""))
+
+    raise RuntimeError("No hay modelos Gemini compatibles con generateContent en esta cuenta.")
 
 
-@router.post("/analizar-foto", response_model=dict, status_code=status.HTTP_201_CREATED)
-def analizar_foto_endpoint(
-        file: UploadFile = File(...),
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Analiza una foto del usuario con IA"""
+def perf_to_riesgo(perfil: Optional[PerfilSalud]) -> SeguridadOut:
+    if not perfil:
+        return SeguridadOut(nivel_riesgo="bajo", validada_por_reglas=True)
+    detonantes, advertencias, riesgo = set(), [], "bajo"
+    for c in perfil.condiciones:
+        key = c.nombre.lower()
+        if key in CONTRAINDICACIONES:
+            detonantes.update(CONTRAINDICACIONES[key]["evitar_tags"])
+            advertencias.extend(CONTRAINDICACIONES[key]["advertencias"])
+            if (c.severidad and c.severidad.lower() in ["moderada","severa"]) or (c.controlada is False):
+                riesgo = "moderado" if riesgo == "bajo" else "alto"
+    for l in perfil.lesiones:
+        if l.zona.lower() == "hombro":
+            detonantes.update(CONTRAINDICACIONES["lesion_hombro"]["evitar_tags"])
+            advertencias.extend(CONTRAINDICACIONES["lesion_hombro"]["advertencias"])
+            riesgo = "moderado" if riesgo == "bajo" else "alto"
+        if l.zona.lower() in ["lumbar", "espalda baja"]:
+            detonantes.update(CONTRAINDICACIONES["lumbalgia crónica"]["evitar_tags"])
+            advertencias.extend(CONTRAINDICACIONES["lumbalgia crónica"]["advertencias"])
+            riesgo = "moderado" if riesgo == "bajo" else "alto"
+    if "embarazo" in [r.lower() for r in perfil.riesgos]:
+        detonantes.update(["impacto_alto", "supino_prolongado", "valsalva"])
+        advertencias.append("Evitar supino prolongado y alto impacto durante el embarazo.")
+        riesgo = "moderado" if riesgo == "bajo" else "alto"
+    return SeguridadOut(
+        nivel_riesgo=riesgo,
+        detonantes_evitar=sorted(detonantes),
+        advertencias=advertencias,
+        validada_por_reglas=False
+    )
 
+def etiqueta_ejercicio(ej: Dict[str, Any]) -> List[str]:
+    txt = " ".join([str(ej.get(k,"")) for k in ["nombre","descripcion","tipo","grupo_muscular","dificultad","notas"]]).lower()
+    tags = set()
+    if "press militar" in txt or "overhead" in txt: tags.add("press_por_encima")
+    if "isometr" in txt and ("30" in txt or "45" in txt): tags.add("isometria_larga")
+    if "hiit" in txt or "saltos" in txt or "burpees" in txt: tags.add("hiit_alto_impacto")
+    if "peso muerto" in txt or "sentadilla" in txt: tags.add("carga_compresiva_lumbar_alta")
+    if "hiperextens" in txt: tags.add("hiperextension_lumbar")
+    if "rotación" in txt and "lumbar" in txt: tags.add("rotacion_lumbar")
+    if "valsalva" in txt: tags.add("valsalva")
+    if "abducción" in txt and ("90" in txt or "noventa" in txt): tags.add("abduccion_90_mas")
+    return list(tags)
+
+def validar_filtrar_ejercicios(perfil: Optional[PerfilSalud], ejercicios: List[Dict[str, Any]]) -> (List[Dict[str, Any]], SeguridadOut):
+    seg = perf_to_riesgo(perfil)
+    if not perfil or not seg.detonantes_evitar:
+        seg.validada_por_reglas = True
+        return ejercicios, seg
+    filtrados, choques = [], 0
+    for ej in ejercicios:
+        if set(etiqueta_ejercicio(ej)) & set(seg.detonantes_evitar):
+            choques += 1
+            continue
+        filtrados.append(ej)
+    if choques == 0:
+        seg.validada_por_reglas = True
+    else:
+        seg.advertencias.append(f"Se eliminaron {choques} ejercicios contraindicados según perfil.")
+    return filtrados, seg
+def _objetivo_es_gluteos(obj: str, foco: Optional[str]) -> bool:
+    txt = (obj or "").lower() + " " + (foco or "")
+    return ("glute" in txt) or ("glúte" in txt)
+
+def _es_casa_sin_equipo(pref: Optional[PreferenciasUsuario]) -> bool:
+    if not pref: return False
+    return (pref.lugar or "").lower() == "casa" and not pref.equipamiento
+
+def _descarta_por_equipo_si_casa_sin_equipo(ej: Dict[str, Any]) -> bool:
+    """True si DEBE descartarse para casa sin equipo."""
+    t = (ej.get("nombre","") + " " + ej.get("descripcion","") + " " + ej.get("tipo","")).lower()
+    if any(p in t for p in PALABRAS_MAQUINAS_GYM): return True
+    if any(p in t for p in PALABRAS_BARRA): return True
+    return False
+
+def _score_prioridad_gluteo(ej: Dict[str, Any]) -> int:
+    """Mayor score = más glúteo."""
+    t = (ej.get("nombre","") + " " + ej.get("descripcion","")).lower()
+    s = 0
+    for kw in PRIORIDAD_GLUTEOS:
+        if kw in t: s += 2
+    # bonus si grupo = PIERNAS/GLÚTEO
+    if "glúteo" in t or (ej.get("grupo_muscular","").upper() in ["PIERNAS","GLÚTEOS"]):
+        s += 1
+    return s
+def _split_por_objetivo(dias: int, objetivos: str, foco: Optional[str]) -> List[List[str]]:
+    """
+    Devuelve un split preferente si el objetivo es glúteos.
+    Si no detecta glúteos, usa los planes genéricos.
+    """
+    txt = (objetivos or "").lower() + " " + (foco or "")
+    es_gluteo = ("glute" in txt) or ("glúte" in txt)
+
+    if not es_gluteo:
+        return PLANES_DISTRIBUCION.get(dias, PLANES_DISTRIBUCION[4])
+
+    # Splits con 2–3 días de glúteos por semana
+    presets = {
+        3: [["GLÚTEOS/PIERNAS"], ["UPPER LIGERO"], ["GLÚTEOS/PIERNAS"]],
+        4: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE/CARDIO SUAVE"]],
+        5: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE/ESTABILIDAD"], ["GLÚTEOS (AISLAMIENTOS)"]],
+        6: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["UPPER LIGERO"], ["GLÚTEOS (AISLAMIENTOS)"], ["CORE/CARDIO"]],
+        7: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE"], ["GLÚTEOS (AISLAMIENTOS)"], ["UPPER LIGERO"], ["DESCANSO"]],
+    }
+
+    # Fallback cercano si no hay preset exacto
+    if dias in presets:
+        return presets[dias]
+    if dias < 3:
+        return presets[3]
+    if dias > 7:
+        return presets[7]
+    return PLANES_DISTRIBUCION.get(dias, PLANES_DISTRIBUCION[4])
+
+# ============================================================
+# FALLBACK LOCAL (consulta BD + distribución)
+# ============================================================
+
+def obtener_ejercicios_por_grupo(db: Session, nivel: str) -> Dict[str, List[Dict[str, Any]]]:
+    print(f"\n🔍 Buscando ejercicios para nivel: {nivel}")
+    grupos = ["PECHO","ESPALDA","BRAZOS","PIERNAS","HOMBROS","CORE","CARDIO"]
+    out: Dict[str, List[Dict[str, Any]]] = {}
+    for g in grupos:
+        q = text("""
+            SELECT id_ejercicio, nombre, descripcion, grupo_muscular, dificultad, tipo
+            FROM ejercicios
+            WHERE grupo_muscular = :grupo AND dificultad = :nivel
+            LIMIT 100
+        """)
+        res = db.execute(q, {"grupo": g, "nivel": nivel}).fetchall()
+        if not res:
+            q2 = text("""
+                SELECT id_ejercicio, nombre, descripcion, grupo_muscular, dificultad, tipo
+                FROM ejercicios
+                WHERE grupo_muscular = :grupo
+                ORDER BY dificultad ASC
+                LIMIT 100
+            """)
+            res = db.execute(q2, {"grupo": g}).fetchall()
+        out[g] = [{
+            "id_ejercicio": r[0],"nombre": r[1],"descripcion": r[2] or "","grupo_muscular": r[3],
+            "dificultad": r[4], "tipo": r[5] or "general"
+        } for r in res]
+    return out
+
+def distribuir_ejercicios_inteligente(
+    ejercicios_por_grupo: Dict[str, List[Dict[str, Any]]],
+    dias_semana: int,
+    nivel: str,
+    objetivo: str,
+    perfil: Optional[PerfilSalud] = None
+) -> (List[DiaRutinaDetallado], SeguridadOut):
+    """
+    Fallback local mejorado:
+    - Split adaptado al objetivo (glúteos) con _split_por_objetivo
+    - Filtro por salud (contraindicaciones)
+    - Filtro por “casa sin equipo”
+    - Priorización de ejercicios de glúteo por score
+    - Evita duplicados dentro del día
+    """
+    dias: List[DiaRutinaDetallado] = []
+    nombres = ["Lunes","Martes","Miércoles","Jueves","Viernes","Sábado","Domingo"]
+
+    # Split por objetivo (glúteos) o genérico
+    plan = _split_por_objetivo(dias_semana, objetivo, None)
+
+    idxs = {g: 0 for g in ejercicios_por_grupo.keys()}
+    advertencias: List[str] = []
+    casa_sin_equipo = _es_casa_sin_equipo(perfil.preferencias if perfil else None)
+
+    # Función local para "expandir" etiquetas artificiales a grupos reales
+    def expandir_grupo(alias: str) -> List[str]:
+        a = alias.upper()
+        if "UPPER" in a:
+            return ["PECHO","ESPALDA","HOMBROS","BRAZOS"]
+        if "GLÚTEOS" in a or "GLUTEOS" in a or "GLUTE" in a:
+            return ["PIERNAS"]  # usamos pool de PIERNAS pero luego priorizamos por score de glúteo
+        if "CORE" in a:
+            return ["CORE"]
+        if "CARDIO" in a:
+            return ["CARDIO"]
+        if "DESCANSO" in a:
+            return ["DESCANSO"]
+        return [a]
+
+    for i, grupos in enumerate(plan):
+        nombre_dia = nombres[i] if i < len(nombres) else f"Día {i+1}"
+        # Expande aliases (UPPER LIGERO, GLÚTEOS/QUADS, etc.)
+        grupos_norm: List[str] = []
+        for g in grupos:
+            # Soporte de alias escritos como "GLÚTEOS/ISQUIOS"
+            partes = [p.strip() for p in g.replace("/", ",").split(",")]
+            for p in partes:
+                grupos_norm.extend(expandir_grupo(p))
+
+        activos = [g for g in grupos_norm if g != "DESCANSO"]
+        n_por_grupo = max(2, 6 // max(1, len(activos)))  # ~5–6 ejercicios/día
+
+        ej_del_dia: List[EjercicioRutina] = []
+        usados: set = set()  # (id, nombre) para evitar duplicados
+
+        for g in grupos_norm:
+            if g == "DESCANSO":
+                continue
+
+            g_pri = MAPEO_GRUPOS_SECUNDARIOS.get(g, g)
+            pool = list(ejercicios_por_grupo.get(g_pri, []))
+
+            # 1) Filtra por salud
+            pool, seg_local = validar_filtrar_ejercicios(perfil, pool)
+            if seg_local.advertencias:
+                advertencias.extend([f"{nombre_dia}/{g}: {a}" for a in seg_local.advertencias])
+
+            # 2) Filtra por equipo si casa sin equipo
+            if casa_sin_equipo:
+                pool = [e for e in pool if not _descarta_por_equipo_si_casa_sin_equipo(e)]
+
+            # 3) Prioriza glúteos por score si el objetivo es glúteos
+            if _objetivo_es_gluteos(objetivo, "gluteo"):
+                pool.sort(key=_score_prioridad_gluteo, reverse=True)
+
+            # 4) Selección circular con deduplicación
+            obtenidos = 0
+            intentos = 0
+            while obtenidos < n_por_grupo and pool and intentos < len(pool) * 2:
+                idx = idxs.get(g_pri, 0) % len(pool)
+                cand = dict(pool[idx])
+                idxs[g_pri] = idxs.get(g_pri, 0) + 1
+                intentos += 1
+
+                clave = (int(cand.get("id_ejercicio", 0)), cand.get("nombre","").strip().lower())
+                if clave in usados:
+                    continue
+                usados.add(clave)
+
+                score = _score_prioridad_gluteo(cand)
+                if nivel == "PRINCIPIANTE":
+                    if score >= 3: series, reps, descanso = 3, 10, 90
+                    else:          series, reps, descanso = 3, 12, 60
+                elif nivel == "AVANZADO":
+                    if score >= 3: series, reps, descanso = 5, 8, 105
+                    else:          series, reps, descanso = 4, 12, 75
+                else:  # INTERMEDIO
+                    if score >= 3: series, reps, descanso = 4, 8, 90
+                    else:          series, reps, descanso = 3, 12, 60
+
+                ej_del_dia.append(EjercicioRutina(
+                    id_ejercicio=int(cand.get("id_ejercicio", 0)),
+                    nombre=str(cand.get("nombre","")),
+                    descripcion=str(cand.get("descripcion","") or ""),
+                    grupo_muscular=str(cand.get("grupo_muscular","")).upper(),
+                    dificultad=str(cand.get("dificultad", nivel)),
+                    tipo=str(cand.get("tipo","general")),
+                    series=series,
+                    repeticiones=reps,
+                    descanso_segundos=descanso,
+                    notas=("enfoque glúteos" if _objetivo_es_gluteos(objetivo, "gluteo") else None)
+                ))
+                obtenidos += 1
+
+        dias.append(DiaRutinaDetallado(
+            numero_dia=i+1,
+            nombre_dia=nombre_dia,
+            descripcion=f"Enfoque: {', '.join(grupos)}",
+            grupos_enfoque=grupos,
+            ejercicios=ej_del_dia
+        ))
+
+    seg_global = perf_to_riesgo(perfil)
+    seguridad = SeguridadOut(
+        nivel_riesgo=seg_global.nivel_riesgo,
+        detonantes_evitar=seg_global.detonantes_evitar,
+        advertencias=advertencias,
+        validada_por_reglas=(len(advertencias) == 0)
+    )
+    return dias, seguridad
+
+
+def calcular_minutos_rutina(dias: List[DiaRutinaDetallado]) -> int:
+    minutos_total = 0
+    for d in dias:
+        m = 0
+        for ej in d.ejercicios:
+            m += (ej.series * ej.repeticiones * 3) + (ej.descanso_segundos * (ej.series - 1))
+        minutos_total += m // 60
+    return max(30, minutos_total // len(dias)) if dias else 45
+
+# ============================================================
+# GEMINI (generador principal)
+# ============================================================
+
+def _build_gemini_prompt(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> str:
+    p = perfil or PerfilSalud()
+    pref = p.preferencias
+    home = (pref.lugar or "").lower() == "casa"
+    no_equipo = not pref.equipamiento
+    objetivo_primario = objetivos.lower()
+
+    reglas_equipo = []
+    if home and no_equipo:
+        reglas_equipo.append("- Si es en casa sin equipamiento, evita máquinas, barras o poleas; usa peso corporal o bandas elásticas.")
+    elif home and pref.equipamiento:
+        reglas_equipo.append(f"- Equipamiento disponible: {pref.equipamiento} (no uses máquinas de gimnasio no listadas).")
+
+    foco_gluteos = ""
+    if "glute" in objetivo_primario or "glúte" in objetivo_primario:
+        foco_gluteos = f"""
+- OBJETIVO PRINCIPAL: GLÚTEOS Y PIERNAS.
+  • Al menos 2–3 días deben enfocarse en tren inferior o glúteos.
+  • Incluye básicos (hip thrust, sentadillas, peso muerto rumano) y accesorios (abducciones, patadas, step-ups, puente de glúteo).
+  • Series y repeticiones orientadas a hipertrofia (4×10-12 reps, 60–90s descanso).
+"""
+
+    # 🧩 Distribución automática por días
+    dist_text = f"""
+El plan debe distribuir los grupos musculares a lo largo de {dias} días de forma equilibrada:
+- Usa el formato push/pull/legs o fullbody, según el nivel ({nivel}).
+- Varía el enfoque cada día: por ejemplo, PECHO/BÍCEPS, ESPALDA/TRÍCEPS, PIERNAS/CORE.
+- Cada día debe tener entre 5 y 7 ejercicios.
+"""
+
+    # 🧍 Perfil del usuario
+    perfil_text = f"""
+Edad: {p.datos.edad}, Sexo: {p.datos.sexo}, Peso: {p.datos.peso_kg}, Estatura: {p.datos.estatura_cm}
+Condiciones: {[c.nombre for c in p.condiciones]}
+Lesiones: {[l.zona+':'+l.tipo for l in p.lesiones]}
+Medicaciones: {[m.nombre for m in p.medicaciones]}
+Preferencias: lugar={pref.lugar}, tiempo={pref.tiempo_minutos}min, días_disponibles={pref.dias_disponibles}, objetivos={pref.objetivos}, gustos={pref.gustos}, disgustos={pref.disgustos}
+"""
+
+    return f"""
+Eres un entrenador profesional y debes crear una rutina de entrenamiento personalizada distribuida en {dias} días.
+
+Requisitos:
+- Nivel del usuario: {nivel}.
+- Objetivos: {objetivos}.
+{dist_text}
+{foco_gluteos}
+{os.linesep.join(reglas_equipo)}
+
+Formato de salida:
+Devuelve **solo JSON válido** con esta estructura:
+
+{{
+  "nombre": "string",
+  "descripcion": "string",
+  "dias_semana": {dias},
+  "minutos_aproximados": {pref.tiempo_minutos or 45},
+  "dias": [
+    {{
+      "numero_dia": 1,
+      "nombre_dia": "Lunes",
+      "descripcion": "Día de tren inferior",
+      "grupos_enfoque": ["PIERNAS","GLÚTEOS"],
+      "ejercicios": [
+        {{
+          "id_ejercicio": 0,
+          "nombre": "Hip Thrust con peso corporal",
+          "descripcion": "Ejercicio para activar glúteos con pausa de 2s arriba",
+          "grupo_muscular": "PIERNAS",
+          "dificultad": "{nivel}",
+          "tipo": "fuerza",
+          "series": 4,
+          "repeticiones": 12,
+          "descanso_segundos": 75,
+          "notas": "énfasis glúteos"
+        }}
+      ]
+    }}
+  ]
+}}
+
+{perfil_text}
+
+⚠️ No incluyas texto adicional fuera del JSON.
+Si no puedes generar la rutina, devuelve un JSON con {{ "error": "no disponible" }}.
+"""
+
+
+def _resp_to_text(resp) -> str:
+    # Intenta .text
+    t = getattr(resp, "text", None)
+    if t:
+        return t
+
+    # Candidatos (SDKs recientes)
     try:
-        contenido = file.file.read()
-        imagen_base64 = base64.b64encode(contenido).decode('utf-8')
+        cands = getattr(resp, "candidates", None) or []
+        if cands:
+            parts = getattr(cands[0], "content", None).parts  # type: ignore
+            if parts:
+                return "".join([getattr(p, "text", "") for p in parts])
+    except Exception:
+        pass
 
-        resultado = analizar_foto_usuario_con_ia(imagen_base64)
+    # Último recurso: str(...)
+    return str(resp)[:2000]
 
-        if not resultado.get("success"):
-            raise HTTPException(status_code=500, detail=resultado.get("error"))
 
-        analisis_data = resultado.get("analisis")
+def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> Dict[str, Any]:
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY no configurada")
 
-        analisis = AnalisisUsuario(
-            id_usuario=current.id_usuario,
-            estado_fisico=analisis_data.get("estado_fisico", ""),
-            composicion_corporal=analisis_data.get("composicion_corporal", ""),
-            observaciones_postura=analisis_data.get("observaciones_postura", ""),
-            recomendaciones=analisis_data.get("recomendaciones", ""),
-            puntuacion_forma_fisica=float(analisis_data.get("puntuacion_forma_fisica", 5)),
-            imagen_url=file.filename,
-        )
-        db.add(analisis)
-        db.commit()
-        db.refresh(analisis)
+    prompt = _build_gemini_prompt(perfil, dias, nivel, objetivos)
+    generation_config = {"response_mime_type": "application/json", "temperature": 0.2, "max_output_tokens": 1024}
 
-        return {
-            "success": True,
-            "id_analisis": analisis.id_analisis,
-            "analisis": analisis_data,
-            "mensaje": "Foto analizada y guardada exitosamente"
-        }
+    last_err = None
+    tried_models = []
 
+    # 1) Intento con el modelo seleccionado dinámicamente
+    try:
+        selected_model = _normalize_model_name(GEMINI_MODEL)
+        tried_models.append(selected_model)
+        model = genai.GenerativeModel(selected_model)
+        try:
+            resp = model.generate_content(prompt, generation_config=generation_config)
+        except TypeError:
+            resp = model.generate_content([prompt], generation_config=generation_config)
+        raw = _resp_to_text(resp)
+        if not raw:
+            pf = getattr(resp, "prompt_feedback", None)
+            raise RuntimeError(f"Gemini devolvió vacío. prompt_feedback={pf}")
+        try:
+            return json.loads(raw)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if not m:
+                raise ValueError(f"Gemini no devolvió JSON válido. raw (400): {raw[:400]}...")
+            return json.loads(m.group(0))
     except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=400, detail=f"Error procesando foto: {str(e)}")
+        last_err = e
+        # Si NO es un error de cuota, propaga tal cual
+        if not _is_quota_error(e):
+            raise RuntimeError(f"Fallo en _gemini_generate_plan: {type(e).__name__}: {str(e)} (modelos probados: {tried_models})")
 
-
-@router.post("/calificar-entrenador")
-def calificar_entrenador_endpoint(
-        payload: CalificacionEntrenadorRequest,
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Califica automáticamente a un entrenador con IA"""
-
-    entrenador = db.query(Usuario).filter(Usuario.id_usuario == payload.id_entrenador).first()
-    if not entrenador:
-        raise HTTPException(status_code=404, detail="Entrenador no encontrado")
-
-    perfil_entrenador = {
-        "nombre": f"{entrenador.nombre} {entrenador.apellido}",
-        "especialidad": getattr(entrenador, "especialidad", "General"),
-        "experiencia": getattr(entrenador, "experiencia", 0),
-        "certificaciones": "N/A",
-        "educacion": "N/A",
-    }
-
-    resultado = calificar_perfil_entrenador_con_ia(perfil_entrenador)
-
-    if not resultado.get("success"):
-        raise HTTPException(status_code=500, detail=resultado.get("error"))
-
-    return {
-        "success": True,
-        "calificacion": resultado.get("calificacion"),
-        "id_entrenador": payload.id_entrenador
-    }
-
-
-@router.post("/registrar-progreso", response_model=dict, status_code=status.HTTP_201_CREATED)
-def registrar_progreso_endpoint(
-        peso_actual: float,
-        notas: str | None = None,
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Registra el progreso (peso) del usuario"""
-
+    # 2) Si fue cuota, intenta con modelo ligero (flash) una vez
     try:
-        progreso = Progreso(
-            id_usuario=current.id_usuario,
-            peso_anterior=current.peso_kg,
-            peso_actual=peso_actual,
-            notas=notas,
+        light_model = FALLBACK_LIGHT_MODEL
+        tried_models.append(light_model)
+        model = genai.GenerativeModel(light_model)
+        try:
+            resp = model.generate_content(prompt, generation_config=generation_config)
+        except TypeError:
+            resp = model.generate_content([prompt], generation_config=generation_config)
+        raw = _resp_to_text(resp)
+        if not raw:
+            raise RuntimeError("Gemini (flash) devolvió vacío.")
+        try:
+            return json.loads(raw)
+        except Exception:
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if not m:
+                raise ValueError("Gemini (flash) no devolvió JSON válido.")
+            return json.loads(m.group(0))
+    except Exception:
+        # Propaga el error original de cuota para que el endpoint decida (429/fallback)
+        raise RuntimeError(
+            f"Fallo en _gemini_generate_plan: {type(last_err).__name__}: {str(last_err)} "
+            f"(modelos probados: {tried_models})"
         )
-        db.add(progreso)
-
-        current.peso_kg = peso_actual
-        db.add(current)
-
-        db.commit()
-        db.refresh(progreso)
-
-        return {
-            "success": True,
-            "id_progreso": progreso.id_progreso,
-            "peso_anterior": progreso.peso_anterior,
-            "peso_actual": progreso.peso_actual,
-            "diferencia": peso_actual - (progreso.peso_anterior or peso_actual),
-            "mensaje": "Progreso registrado exitosamente en BD"
-        }
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error guardando progreso: {str(e)}")
 
 
-@router.get("/progreso/historial", response_model=List[ProgresoOut])
-def obtener_progreso_endpoint(
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Obtiene el historial de progreso del usuario"""
+def _from_gemini_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional[PerfilSalud]) -> (List[DiaRutinaDetallado], SeguridadOut):
+    dias_py: List[DiaRutinaDetallado] = []
+    advertencias: List[str] = []
+    for d in plan.get("dias", []):
+        ejercicios_in = d.get("ejercicios", [])
+        ejercicios_filtrados, seg_local = validar_filtrar_ejercicios(perfil, ejercicios_in)
+        if seg_local.advertencias:
+            advertencias.extend([f"{d.get('nombre_dia','Día?')}: {a}" for a in seg_local.advertencias])
+        ejercicios_out = [EjercicioRutina(
+            id_ejercicio=int(e.get("id_ejercicio", 0)),
+            nombre=str(e.get("nombre","")).strip(),
+            descripcion=str(e.get("descripcion","") or ""),
+            grupo_muscular=str(e.get("grupo_muscular","GENERAL")).upper(),
+            dificultad=str(e.get("dificultad", nivel_norm)),
+            tipo=str(e.get("tipo","general")),
+            series=int(e.get("series", 3)),
+            repeticiones=int(e.get("repeticiones", 10)),
+            descanso_segundos=int(e.get("descanso_segundos", 60)),
+            notas=e.get("notas")
+        ) for e in ejercicios_filtrados]
 
-    progresos = db.query(Progreso) \
-        .filter(Progreso.id_usuario == current.id_usuario) \
-        .order_by(Progreso.fecha.desc()) \
-        .all()
+        dias_py.append(DiaRutinaDetallado(
+            numero_dia=int(d.get("numero_dia", len(dias_py)+1)),
+            nombre_dia=str(d.get("nombre_dia", f"Día {len(dias_py)+1}")),
+            descripcion=str(d.get("descripcion","")),
+            grupos_enfoque=[str(x).upper() for x in d.get("grupos_enfoque", [])],
+            ejercicios=ejercicios_out
+        ))
 
-    return progresos
+    seg_global = perf_to_riesgo(perfil)
+    seguridad = SeguridadOut(
+        nivel_riesgo=seg_global.nivel_riesgo,
+        detonantes_evitar=seg_global.detonantes_evitar,
+        advertencias=advertencias,
+        validada_por_reglas=(len(advertencias) == 0)
+    )
+    return dias_py, seguridad
 
+# ============================================================
+# ENDPOINTS
+# ============================================================
 
-@router.get("/analisis/ultimo", response_model=dict)
-def obtener_ultimo_analisis_endpoint(
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Obtiene el último análisis de foto del usuario"""
-
-    analisis = db.query(AnalisisUsuario) \
-        .filter(AnalisisUsuario.id_usuario == current.id_usuario) \
-        .order_by(AnalisisUsuario.fecha_analisis.desc()) \
-        .first()
-
-    if not analisis:
-        raise HTTPException(status_code=404, detail="No hay análisis registrado")
-
-    return {
-        "id_analisis": analisis.id_analisis,
-        "estado_fisico": analisis.estado_fisico,
-        "composicion_corporal": analisis.composicion_corporal,
-        "observaciones_postura": analisis.observaciones_postura,
-        "recomendaciones": analisis.recomendaciones,
-        "puntuacion": analisis.puntuacion_forma_fisica,
-        "fecha": analisis.fecha_analisis
-    }
-
-
-@router.get("/rutinas/mis-rutinas", response_model=List[dict])
-def obtener_mis_rutinas_endpoint(
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Obtiene todas las rutinas generadas del usuario"""
-
-    rutinas = db.query(RutinaGenerada) \
-        .filter(RutinaGenerada.id_usuario == current.id_usuario) \
-        .order_by(RutinaGenerada.fecha_generacion.desc()) \
-        .all()
-
-    resultado = []
-    for rutina in rutinas:
-        resultado.append({
-            "id_rutina_generada": rutina.id_rutina_generada,
-            "nombre": rutina.nombre,
-            "descripcion": rutina.descripcion,
-            "duracion_minutos": rutina.duracion_minutos,
-            "dificultad": rutina.dificultad,
-            "ejercicios": json.loads(rutina.ejercicios),
-            "fecha_generacion": rutina.fecha_generacion,
-            "modelo_ia": rutina.modelo_ia
-        })
-
-    return resultado
-
-
-@router.get("/rutinas/{id_rutina}", response_model=dict)
-def obtener_rutina_endpoint(
-        id_rutina: int,
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Obtiene una rutina específica generada"""
-
-    rutina = db.query(RutinaGenerada) \
-        .filter(
-        RutinaGenerada.id_rutina_generada == id_rutina,
-        RutinaGenerada.id_usuario == current.id_usuario
-    ) \
-        .first()
-
-    if not rutina:
-        raise HTTPException(status_code=404, detail="Rutina no encontrada")
-
-    return {
-        "id_rutina_generada": rutina.id_rutina_generada,
-        "nombre": rutina.nombre,
-        "descripcion": rutina.descripcion,
-        "duracion_minutos": rutina.duracion_minutos,
-        "dificultad": rutina.dificultad,
-        "ejercicios": json.loads(rutina.ejercicios),
-        "fecha_generacion": rutina.fecha_generacion,
-        "modelo_ia": rutina.modelo_ia
-    }
-
-
-@router.post("/analizar-perfil", response_model=dict, status_code=status.HTTP_201_CREATED)
-def analizar_perfil_usuario_endpoint(
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Analiza el perfil completo del usuario con IA"""
-
-    usuario = db.query(Usuario).filter(Usuario.id_usuario == current.id_usuario).first()
-    if not usuario:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
-    perfil_usuario = {
-        "nombre": f"{usuario.nombre} {usuario.apellido}",
-        "edad": usuario.edad,
-        "peso_kg": usuario.peso_kg,
-        "estatura_cm": usuario.estatura_cm,
-        "problemas": usuario.problemas,
-        "enfermedades": usuario.enfermedades if isinstance(usuario.enfermedades, list) else [],
-        "objetivo": getattr(usuario, "objetivo", "Fitness general"),
-    }
-
-    resultado = analizar_perfil_usuario_con_ia(perfil_usuario)
-
-    if not resultado.get("success"):
-        raise HTTPException(status_code=500, detail=resultado.get("error"))
-
-    analisis_data = resultado.get("analisis")
-
+@router.post("/generar-rutina", response_model=Dict[str, Any])
+def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = Depends(get_db)):
+    """
+    Genera una rutina con IA (Gemini) ajustada por perfil de salud.
+    - proveedor="auto"   -> intenta Gemini; si hay cuota, cambia a flash 1 vez; si falla, fallback local.
+    - proveedor="gemini" -> exige Gemini (si cuota 429, si otro error 502).
+    - proveedor="local"  -> usa generador local directamente.
+    """
     try:
-        # Convertir listas a strings JSON
-        recomendaciones_entrenamiento = analisis_data.get("recomendaciones_entrenamiento", "")
-        if isinstance(recomendaciones_entrenamiento, list):
-            recomendaciones_entrenamiento = json.dumps(recomendaciones_entrenamiento, ensure_ascii=False)
+        if not (2 <= solicitud.dias <= 7):
+            raise HTTPException(status_code=422, detail="Días debe estar entre 2 y 7")
 
-        recomendaciones_nutricion = analisis_data.get("recomendaciones_nutricion", "")
-        if isinstance(recomendaciones_nutricion, list):
-            recomendaciones_nutricion = json.dumps(recomendaciones_nutricion, ensure_ascii=False)
+        nivel_map = {"principiante": "PRINCIPIANTE", "intermedio": "INTERMEDIO", "avanzado": "AVANZADO"}
+        nivel_norm = nivel_map.get(solicitud.nivel.lower(), "INTERMEDIO")
+        prov = getattr(solicitud, "proveedor", "auto")
 
-        objetivos_sugeridos = analisis_data.get("objetivos_sugeridos", "")
-        if isinstance(objetivos_sugeridos, list):
-            objetivos_sugeridos = json.dumps(objetivos_sugeridos, ensure_ascii=False)
+        if prov == "gemini" and not GEMINI_API_KEY:
+            raise HTTPException(status_code=502, detail="Gemini requerido pero GEMINI_API_KEY no está configurada")
+
+        generada_por = "gemini"
+        descripcion = "Rutina generada por IA (Gemini) con validación de seguridad"
+
+        if prov == "local":
+            ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
+            if not any(ejercicios_por_grupo.values()):
+                raise HTTPException(status_code=400, detail="No hay ejercicios disponibles en la base de datos")
+
+            dias, seguridad = distribuir_ejercicios_inteligente(
+                ejercicios_por_grupo=ejercicios_por_grupo,
+                dias_semana=solicitud.dias,
+                nivel=nivel_norm,
+                objetivo=solicitud.objetivos,
+                perfil=solicitud.perfil_salud
+            )
+            generada_por = "local"
+            descripcion = "Rutina generada localmente (respaldo) con validación de seguridad"
+
         else:
-            objetivos_sugeridos = str(objetivos_sugeridos)
+            try:
+                plan_json = _gemini_generate_plan(
+                    perfil=solicitud.perfil_salud,
+                    dias=solicitud.dias,
+                    nivel=nivel_norm,
+                    objetivos=solicitud.objetivos
+                )
+                dias, seguridad = _from_gemini_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
 
-        riesgos_potenciales = analisis_data.get("riesgos_potenciales", "")
-        if isinstance(riesgos_potenciales, list):
-            riesgos_potenciales = json.dumps(riesgos_potenciales, ensure_ascii=False)
-        else:
-            riesgos_potenciales = str(riesgos_potenciales)
+            except Exception as ge:
+                # --- Diferenciación clara de errores ---
+                if prov == "gemini":
+                    status_code = 429 if _is_quota_error(ge) else 502
+                    raise HTTPException(
+                        status_code=status_code,
+                        detail={
+                            "error": "quota_exceeded" if status_code == 429 else "gemini_error",
+                            "message": str(ge),
+                            "hint": "Usa proveedor='auto' para fallback local automático o revisa cuotas/billing.",
+                        }
+                    )
 
-        analisis = AnalisisPerfil(
-            id_usuario=current.id_usuario,
-            categoria_fitness=analisis_data.get("categoria_fitness", ""),
-            nivel_condicion=analisis_data.get("nivel_condicion", ""),
-            recomendaciones_entrenamiento=str(recomendaciones_entrenamiento),
-            recomendaciones_nutricion=str(recomendaciones_nutricion),
-            objetivos_sugeridos=objetivos_sugeridos,
-            riesgos_potenciales=riesgos_potenciales,
-            puntuacion_general=float(analisis_data.get("puntuacion_general", 0))
+                # Modo auto: fallback local
+                ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
+                if not any(ejercicios_por_grupo.values()):
+                    raise HTTPException(status_code=400, detail="No hay ejercicios disponibles en la base de datos")
+
+                dias, seguridad = distribuir_ejercicios_inteligente(
+                    ejercicios_por_grupo=ejercicios_por_grupo,
+                    dias_semana=solicitud.dias,
+                    nivel=nivel_norm,
+                    objetivo=solicitud.objetivos,
+                    perfil=solicitud.perfil_salud
+                )
+                generada_por = "local"
+                descripcion = "Rutina generada localmente (respaldo) por límite de cuota o error de IA"
+
+        total_ejercicios = sum(len(d.ejercicios) for d in dias)
+        minutos = calcular_minutos_rutina(dias)
+
+        base = RutinaCompleta(
+            nombre=f"Rutina de {nivel_norm} - {solicitud.objetivos.title()}",
+            descripcion=descripcion,
+            id_cliente=solicitud.id_cliente,
+            objetivo=solicitud.objetivos,
+            grupo_muscular=solicitud.grupo_muscular_foco or "General",
+            nivel=nivel_norm,
+            dias_semana=solicitud.dias,
+            total_ejercicios=total_ejercicios,
+            minutos_aproximados=minutos,
+            dias=dias,
+            fecha_creacion=datetime.now().isoformat(),
+            generada_por=generada_por
         )
-        db.add(analisis)
-        db.commit()
-        db.refresh(analisis)
 
-        return {
-            "success": True,
-            "id_analisis_perfil": analisis.id_analisis_perfil,
-            "analisis": analisis_data,
-            "mensaje": "Perfil analizado y guardado"
-        }
+        return {**base.model_dump(), "seguridad": seguridad.model_dump(), "proveedor": prov}
+
+    except HTTPException:
+        raise
     except Exception as e:
-        db.rollback()
+        import traceback; traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Error al generar rutina: {str(e)}")
+
+
+@router.get("/gemini/debug")
+def gemini_debug():
+    try:
+        if not GEMINI_API_KEY:
+            return {"status": "error", "message": "GEMINI_API_KEY no configurada"}
+
+        model = genai.GenerativeModel(GEMINI_MODEL)
+        prompt = 'Devuelve SOLO este JSON: {"ok": true, "modelo": "' + GEMINI_MODEL + '"}'
+        try:
+            resp = model.generate_content(prompt, generation_config={"response_mime_type": "application/json", "temperature": 0.0})
+        except TypeError:
+            resp = model.generate_content([prompt], generation_config={"response_mime_type": "application/json", "temperature": 0.0})
+
+        raw = _resp_to_text(resp)
+        return {"status": "ok", "raw": raw}
+    except Exception as e:
+        return {"status": "error", "message": f"{type(e).__name__}: {str(e)}"}
+
+
+@router.get("/ejercicios/sugerencias")
+def obtener_ejercicios_sugeridos(
+        grupo: str = "general",
+        nivel: str = "intermedio",
+        limite: int = 20,
+        db: Session = Depends(get_db)
+):
+    try:
+        nivel_map = {"principiante":"PRINCIPIANTE","intermedio":"INTERMEDIO","avanzado":"AVANZADO"}
+        nivel_norm = nivel_map.get(nivel.lower(), "INTERMEDIO")
+
+        q = text("""
+            SELECT id_ejercicio, nombre, descripcion, grupo_muscular, dificultad, tipo
+            FROM ejercicios WHERE grupo_muscular = :grupo LIMIT :limite
+        """)
+        res = db.execute(q, {"grupo": grupo.upper(), "limite": limite}).fetchall()
+
+        ejercicios = [{
+            "id_ejercicio": e[0], "nombre": e[1], "descripcion": e[2] or "",
+            "grupo_muscular": e[3], "dificultad": e[4], "tipo": e[5] or "general"
+        } for e in res]
+
+        return {"total": len(ejercicios), "grupo": grupo, "nivel": nivel_norm, "ejercicios": ejercicios}
+    except Exception as e:
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
-@router.get("/analisis-perfil", response_model=dict)
-def obtener_analisis_perfil_endpoint(
-        current: Usuario = Depends(get_current_user),
-        db: Session = Depends(get_db),
-):
-    """Obtiene el análisis de perfil del usuario"""
-
-    analisis = db.query(AnalisisPerfil) \
-        .filter(AnalisisPerfil.id_usuario == current.id_usuario) \
-        .order_by(AnalisisPerfil.fecha_analisis.desc()) \
-        .first()
-
-    if not analisis:
-        raise HTTPException(status_code=404, detail="No hay análisis registrado")
-
+@router.get("/planes/distribucion")
+def obtener_planes_distribucion():
     return {
-        "id_analisis_perfil": analisis.id_analisis_perfil,
-        "categoria_fitness": analisis.categoria_fitness,
-        "nivel_condicion": analisis.nivel_condicion,
-        "recomendaciones_entrenamiento": analisis.recomendaciones_entrenamiento,
-        "recomendaciones_nutricion": analisis.recomendaciones_nutricion,
-        "objetivos_sugeridos": analisis.objetivos_sugeridos,
-        "riesgos_potenciales": analisis.riesgos_potenciales,
-        "puntuacion_general": analisis.puntuacion_general,
-        "fecha_analisis": analisis.fecha_analisis
+        "planes_disponibles": {
+            "2_dias": PLANES_DISTRIBUCION[2],
+            "3_dias": PLANES_DISTRIBUCION[3],
+            "4_dias": PLANES_DISTRIBUCION[4],
+            "5_dias": PLANES_DISTRIBUCION[5],
+            "6_dias": PLANES_DISTRIBUCION[6],
+            "7_dias": PLANES_DISTRIBUCION[7],
+        },
+        "descripcion": "Planes de distribución de grupos musculares por día"
     }
+
+@router.get("/gemini/status")
+def gemini_status():
+    try:
+        if not GEMINI_API_KEY:
+            return {"status": "warning", "message": "GEMINI_API_KEY no configurada", "fallback": "enabled (local)"}
+
+        models_info = []
+        try:
+            for m in genai.list_models():
+                models_info.append({
+                    "name": getattr(m, "name", ""),
+                    "id": _normalize_model_name(getattr(m, "name", "")),
+                    "supports_generateContent": _supports_generate_content(m)
+                })
+        except Exception as e:
+            models_info = [{"error_list_models": str(e)}]
+
+        selected = None
+        try:
+            selected = _select_gemini_model()
+        except Exception as e:
+            selected = f"(selección fallida) {type(e).__name__}: {str(e)}"
+
+        return {
+            "status": "ok",
+            "wanted_env": os.getenv("GEMINI_MODEL"),
+            "selected_model": selected,
+            "models": models_info
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+

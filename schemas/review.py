@@ -45,7 +45,7 @@ class ResenaOut(BaseModel):
 
 class EstadisticasEntrenador(BaseModel):
     id_entrenador: int
-    calificacion_promedio: float
+    promedio_calificacion: float
     total_resenas: int
     resenas_recientes: List[ResenaOut] = []
 

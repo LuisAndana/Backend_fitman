@@ -1,224 +1,207 @@
-# services/ia_service.py
-import os
-from dotenv import load_dotenv
-import google.generativeai as genai
-from datetime import datetime
+# services/ia_service.py - Servicio de IA mejorado con fallback
 
-load_dotenv()
+from typing import List, Optional
+import random
+from pydantic import BaseModel
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-genai.configure(api_key=GEMINI_API_KEY)
-
-
-def generar_rutina_con_ia(perfil_cliente: dict) -> dict:
-    """
-    Genera una rutina personalizada basada en el perfil del cliente usando Gemini
-    """
-
-    prompt = f"""
-    Eres un entrenador personal experto. Genera una rutina de entrenamiento personalizada.
-
-    Datos del cliente:
-    - Nombre: {perfil_cliente.get('nombre', 'Cliente')}
-    - Edad: {perfil_cliente.get('edad', 'N/A')} años
-    - Peso: {perfil_cliente.get('peso_kg', 'N/A')} kg
-    - Estatura: {perfil_cliente.get('estatura_cm', 'N/A')} cm
-    - Problemas: {perfil_cliente.get('problemas', 'Ninguno')}
-    - Enfermedades: {', '.join(perfil_cliente.get('enfermedades', [])) or 'Ninguna'}
-    - Objetivo: {perfil_cliente.get('objetivo', 'Fitness general')}
-
-    Por favor genera:
-    1. Nombre de la rutina
-    2. Descripción (2-3 líneas)
-    3. Duración en minutos
-    4. Dificultad (Principiante, Intermedio, Avanzado)
-    5. Una lista de 5-7 ejercicios con:
-       - Nombre del ejercicio
-       - Series
-       - Repeticiones
-       - Descanso en segundos
-       - Notas/recomendaciones
-
-    Responde en formato JSON válido.
-    """
-
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash')  # ← Modelo actualizado
-        response = model.generate_content(prompt)
-
-        # Parsear respuesta
-        import json
-        import re
-
-        # Extraer JSON de la respuesta
-        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        if json_match:
-            rutina_json = json.loads(json_match.group())
-            return {
-                "success": True,
-                "rutina": rutina_json,
-                "generada_en": datetime.utcnow().isoformat()
-            }
-        else:
-            return {
-                "success": False,
-                "error": "No se pudo extraer JSON de la respuesta",
-                "respuesta_raw": response.text
-            }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+class EjercicioIA(BaseModel):
+    id_ejercicio: int
+    nombre: str
+    descripcion: str
+    grupo_muscular: str
+    dificultad: str
+    tipo: str
+    series: int = 3
+    repeticiones: int = 10
+    descanso_segundos: int = 60
+    notas: Optional[str] = None
 
 
-def analizar_foto_usuario_con_ia(imagen_base64: str) -> dict:
-    """
-    Analiza una foto del usuario para hacer una evaluación visual
-    """
+class RutinaLocal(BaseModel):
+    nombre: str
+    descripcion: str
+    ejercicios: List[EjercicioIA]
+    total_ejercicios: int
+    minutos_aproximados: int
+    dias_semana: int
+    nivel: str
+    objetivo: str
 
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash')  # ← Modelo actualizado
 
-        image_data = {
-            "mime_type": "image/jpeg",
-            "data": imagen_base64
-        }
+class IAService:
+    """Servicio para manejar la lógica de IA y generación local"""
 
-        prompt = """
-        Analiza esta foto de una persona y proporciona:
-        1. Evaluación visual del estado físico (Sedentario, Moderado, Fit, Muy fit)
-        2. Posible composición corporal (Sobrepeso, Normal, Musculoso, Muy musculoso)
-        3. Observaciones sobre postura
-        4. Recomendaciones generales de ejercicio (2-3 líneas)
-        5. Puntuación de forma física (1-10)
-
-        Sé respetuoso y constructivo. Responde en JSON.
+    @staticmethod
+    def generar_rutina_local(
+        ejercicios: List[dict],
+        dias: int,
+        nivel: str,
+        objetivos: str
+    ) -> RutinaLocal:
         """
+        Genera una rutina usando lógica local cuando Gemini no funciona.
+        Fallback robusto que garantiza una rutina válida.
+        """
+        print("\n⚠️  Usando generación local (Gemini no disponible)")
+        print("─" * 60)
 
-        response = model.generate_content([prompt, image_data])
+        if not ejercicios:
+            raise ValueError("No hay ejercicios disponibles para generar rutina")
 
+        # Agrupar ejercicios por tipo
+        ejercicios_por_tipo = {}
+        for ej in ejercicios:
+            tipo = ej.get('tipo', 'general')
+            if tipo not in ejercicios_por_tipo:
+                ejercicios_por_tipo[tipo] = []
+            ejercicios_por_tipo[tipo].append(ej)
+
+        # Construir rutina seleccionando ejercicios variados
+        rutina_ejercicios = []
+        ejercicios_por_dia = max(4, len(ejercicios) // dias)
+
+        seleccionados = set()
+        for _ in range(min(dias * ejercicios_por_dia, len(ejercicios))):
+            # Seleccionar ejercicio aleatorio que no esté repetido
+            ej = random.choice(ejercicios)
+            if ej.get('id_ejercicio') not in seleccionados:
+                seleccionados.add(ej.get('id_ejercicio'))
+
+                # Ajustar series/repeticiones según nivel
+                if nivel == "PRINCIPIANTE":
+                    series = 2
+                    repeticiones = 10
+                    descanso = 90
+                elif nivel == "AVANZADO":
+                    series = 4
+                    repeticiones = 8
+                    descanso = 45
+                else:  # INTERMEDIO
+                    series = 3
+                    repeticiones = 10
+                    descanso = 60
+
+                rutina_ejercicios.append(
+                    EjercicioIA(
+                        id_ejercicio=ej.get('id_ejercicio', 0),
+                        nombre=ej.get('nombre', 'Ejercicio'),
+                        descripcion=ej.get('descripcion', ''),
+                        grupo_muscular=ej.get('grupo_muscular', 'general'),
+                        dificultad=ej.get('dificultad', nivel),
+                        tipo=ej.get('tipo', 'general'),
+                        series=series,
+                        repeticiones=repeticiones,
+                        descanso_segundos=descanso,
+                        notas=f"Recomendado para {objetivos.lower()}"
+                    )
+                )
+
+        # Calcular tiempo aproximado
+        minutos = sum(
+            (ej.series * ej.repeticiones * 3 + ej.descanso_segundos) // 60
+            for ej in rutina_ejercicios
+        ) // dias
+
+        rutina = RutinaLocal(
+            nombre=f"Rutina de {nivel.capitalize()} - {objetivos.title()}",
+            descripcion=f"Rutina personalizada para: {objetivos}",
+            ejercicios=rutina_ejercicios,
+            total_ejercicios=len(rutina_ejercicios),
+            minutos_aproximados=max(30, minutos),
+            dias_semana=dias,
+            nivel=nivel,
+            objetivo=objetivos
+        )
+
+        print(f"✅ Rutina generada localmente")
+        print(f"   - {len(rutina_ejercicios)} ejercicios")
+        print(f"   - {rutina.minutos_aproximados} minutos aprox")
+        print()
+
+        return rutina
+
+    @staticmethod
+    def normalizar_valor_enum(valor: str, tipo: str = "nivel") -> Optional[str]:
+        """Normaliza valores de enums a los valores válidos en MySQL."""
+        if not valor:
+            return None
+
+        valor_limpio = valor.strip().upper()
+
+        if tipo == "nivel":
+            mapeo = {
+                "PRINCIPIANTE": "PRINCIPIANTE",
+                "BEGINNER": "PRINCIPIANTE",
+                "FACIL": "PRINCIPIANTE",
+                "INTERMEDIO": "INTERMEDIO",
+                "INTERMEDIATE": "INTERMEDIO",
+                "AVANZADO": "AVANZADO",
+                "ADVANCED": "AVANZADO",
+                "GENERAL": None,
+            }
+            return mapeo.get(valor_limpio, None)
+
+        elif tipo == "grupo":
+            mapeo = {
+                "PECHO": "PECHO",
+                "ESPALDA": "ESPALDA",
+                "BRAZOS": "BRAZOS",
+                "PIERNAS": "PIERNAS",
+                "HOMBROS": "HOMBROS",
+                "CORE": "CORE",
+                "CARDIO": "CARDIO",
+                "GENERAL": None,
+            }
+            return mapeo.get(valor_limpio, None)
+
+        return None
+
+    @staticmethod
+    def construir_prompt_rutina(
+        nombre_alumno: str,
+        ejercicios: List[dict],
+        dias: int,
+        nivel: str,
+        objetivos: str
+    ) -> str:
+        """Construye el prompt para Gemini."""
         import json
-        import re
 
-        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        if json_match:
-            analisis = json.loads(json_match.group())
-            return {
-                "success": True,
-                "analisis": analisis,
-                "fecha_analisis": datetime.utcnow().isoformat()
-            }
-        else:
-            return {
-                "success": False,
-                "error": "No se pudo extraer JSON",
-                "respuesta_raw": response.text
-            }
+        ejercicios_json = json.dumps([{
+            "id": e.get('id_ejercicio'),
+            "nombre": e.get('nombre'),
+            "grupo_muscular": e.get('grupo_muscular'),
+            "dificultad": e.get('dificultad'),
+        } for e in ejercicios[:30]], ensure_ascii=False)
 
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
+        prompt = f"""
+Eres un entrenador personal experto en diseño de rutinas personalizadas.
 
+ALUMNO: {nombre_alumno}
+NIVEL: {nivel}
+DÍAS POR SEMANA: {dias}
+OBJETIVOS: {objetivos}
 
-def calificar_perfil_entrenador_con_ia(perfil_entrenador: dict) -> dict:
-    """
-    Califica automáticamente a un entrenador basado en su perfil
-    """
+EJERCICIOS DISPONIBLES (selecciona solo de aquí):
+{ejercicios_json}
 
-    prompt = f"""
-    Califica este perfil de entrenador en una escala del 1-5:
+Genera una rutina de {dias} días usando SOLO ejercicios de la lista.
+Responde en JSON válido con esta estructura:
 
-    Nombre: {perfil_entrenador.get('nombre', 'N/A')}
-    Especialidad: {perfil_entrenador.get('especialidad', 'N/A')}
-    Experiencia (años): {perfil_entrenador.get('experiencia', 'N/A')}
-    Certificaciones: {perfil_entrenador.get('certificaciones', 'N/A')}
-    Educación: {perfil_entrenador.get('educacion', 'N/A')}
-
-    Proporciona:
-    1. Puntuación general (1-5)
-    2. Fortalezas (3 máximo)
-    3. Áreas de mejora (2-3)
-    4. Recomendación si contratar (Sí/No/Tal vez)
-
-    Responde en JSON.
-    """
-
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash')  # ← Modelo actualizado
-        response = model.generate_content(prompt)
-
-        import json
-        import re
-
-        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        if json_match:
-            calificacion = json.loads(json_match.group())
-            return {
-                "success": True,
-                "calificacion": calificacion
-            }
-        else:
-            return {
-                "success": False,
-                "error": "No se pudo extraer JSON"
-            }
-
-    except Exception as e:
-        return {
-            "success": False,
-            "error": str(e)
-        }
-
-
-def analizar_perfil_usuario_con_ia(perfil_usuario: dict) -> dict:
-    """
-    Analiza el perfil completo del usuario
-    """
-
-    # Convertir a float para evitar errores con Decimal
-    peso = float(perfil_usuario.get("peso_kg") or 70)
-    estatura_cm = float(perfil_usuario.get("estatura_cm") or 170)
-    estatura_m = estatura_cm / 100
-    imc = peso / (estatura_m ** 2) if estatura_m > 0 else 0
-
-    prompt = f"""
-    Analiza el perfil de este usuario:
-
-    - Nombre: {perfil_usuario.get('nombre', 'Usuario')}
-    - Edad: {perfil_usuario.get('edad', 'N/A')} años
-    - Peso: {peso} kg, Estatura: {estatura_cm} cm
-    - IMC: {imc:.2f}
-    - Problemas: {perfil_usuario.get('problemas', 'Ninguno')}
-    - Enfermedades: {', '.join(perfil_usuario.get('enfermedades', [])) or 'Ninguna'}
-    - Objetivo: {perfil_usuario.get('objetivo', 'Fitness general')}
-
-    Proporciona en JSON:
-    1. categoria_fitness (Sedentario/Moderado/Activo/Muy activo)
-    2. nivel_condicion (Principiante/Intermedio/Avanzado)
-    3. recomendaciones_entrenamiento (4-5 líneas)
-    4. recomendaciones_nutricion (3-4 líneas)
-    5. objetivos_sugeridos (2-3 objetivos)
-    6. riesgos_potenciales (2-3 riesgos)
-    7. puntuacion_general (1-10)
-    """
-
-    try:
-        model = genai.GenerativeModel('gemini-2.0-flash')
-        response = model.generate_content(prompt)
-
-        import json
-        import re
-
-        json_match = re.search(r'\{.*\}', response.text, re.DOTALL)
-        if json_match:
-            analisis = json.loads(json_match.group())
-            return {"success": True, "analisis": analisis}
-        else:
-            return {"success": False, "error": "No se pudo extraer JSON"}
-
-    except Exception as e:
-        return {"success": False, "error": str(e)}
+{{
+  "nombre": "nombre de la rutina",
+  "descripcion": "descripción breve",
+  "ejercicios": [
+    {{
+      "id_ejercicio": 1,
+      "nombre": "nombre del ejercicio",
+      "series": 3,
+      "repeticiones": 10,
+      "descanso_segundos": 60
+    }}
+  ],
+  "total_ejercicios": 6,
+  "minutos_aproximados": 45
+}}
+"""
+        return prompt

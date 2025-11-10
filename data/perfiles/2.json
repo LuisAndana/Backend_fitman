@@ -1,16 +1,48 @@
 {
-  "resumen": "me gusta la hipertrofia",
+  "resumen": "",
+  "especialidad": "me gustan los capibaras",
+  "especialidades": [
+    "soy la mera barba"
+  ],
+  "experiencia": 0,
+  "certificaciones": "string",
+  "modalidades": [
+    "string"
+  ],
+  "ciudad": "string",
+  "precio": 0.0,
   "educacion": [
     {
-      "titulo": "SEP",
-      "institucion": "SEP",
-      "inicio": "2010",
-      "fin": "2012",
-      "descripcion": "LO LOGRE",
-      "evidenciaUrl": null
+      "titulo": "string",
+      "institucion": "string",
+      "inicio": "string",
+      "fin": "string",
+      "descripcion": "string",
+      "evidenciaUrl": "string"
     }
   ],
-  "diplomas": [],
-  "cursos": [],
-  "logros": []
+  "diplomas": [
+    {
+      "titulo": "string",
+      "institucion": "string",
+      "fecha": "string",
+      "evidenciaUrl": "string"
+    }
+  ],
+  "cursos": [
+    {
+      "titulo": "string",
+      "institucion": "string",
+      "fecha": "string",
+      "evidenciaUrl": "string"
+    }
+  ],
+  "logros": [
+    {
+      "titulo": "string",
+      "anio": "string",
+      "descripcion": "string",
+      "evidenciaUrl": "string"
+    }
+  ]
 }

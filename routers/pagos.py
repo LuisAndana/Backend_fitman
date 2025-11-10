@@ -3,8 +3,7 @@ from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List
 
-from utils.dependencies import get_db, get_current_user
-from models.user import Usuario
+from utils.dependencies import get_db
 from schemas.payment import (
     PagoCreate, PagoOut,
     SuscripcionCreate, SuscripcionOut, SuscripcionUpdate,
@@ -30,28 +29,26 @@ router = APIRouter(prefix="/pagos", tags=["pagos"])
 
 @router.post("", response_model=PagoOut, status_code=status.HTTP_201_CREATED)
 def crear_pago_endpoint(
-        payload: PagoCreate,
-        current: Usuario = Depends(get_current_user),
+        id_cliente: int = Query(..., description="ID del cliente"),
+        payload: PagoCreate = None,
         db: Session = Depends(get_db),
 ):
     """Crea un nuevo registro de pago"""
-    pago = crear_pago(db, current.id_usuario, payload)
+    if payload is None:
+        raise HTTPException(status_code=400, detail="Body del request es requerido")
+    pago = crear_pago(db, id_cliente, payload)
     return pago
 
 
 @router.get("/{id_pago}", response_model=PagoOut)
 def obtener_pago_endpoint(
         id_pago: int,
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Obtiene detalles de un pago específico"""
     pago = obtener_pago(db, id_pago)
     if not pago:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
-
-    if pago.id_cliente != current.id_usuario and pago.id_entrenador != current.id_usuario:
-        raise HTTPException(status_code=403, detail="No tienes permiso para ver este pago")
 
     return pago
 
@@ -60,16 +57,12 @@ def obtener_pago_endpoint(
 def confirmar_pago_endpoint(
         id_pago: int,
         referencia_externa: str | None = Query(None),
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Confirma un pago pendiente (simulación de webhook)"""
     pago = obtener_pago(db, id_pago)
     if not pago:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
-
-    if pago.id_entrenador != current.id_usuario:
-        raise HTTPException(status_code=403, detail="No tienes permiso para confirmar este pago")
 
     confirmar_pago(db, id_pago, referencia_externa)
     pago_actualizado = obtener_pago(db, id_pago)
@@ -79,7 +72,6 @@ def confirmar_pago_endpoint(
 @router.post("/{id_pago}/cancelar", status_code=status.HTTP_204_NO_CONTENT)
 def cancelar_pago_endpoint(
         id_pago: int,
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Cancela un pago pendiente"""
@@ -87,21 +79,18 @@ def cancelar_pago_endpoint(
     if not pago:
         raise HTTPException(status_code=404, detail="Pago no encontrado")
 
-    if pago.id_cliente != current.id_usuario:
-        raise HTTPException(status_code=403, detail="No tienes permiso para cancelar este pago")
-
     cancelar_pago(db, id_pago)
     return None
 
 
 @router.get("/cliente/historial", response_model=HistorialPagos)
 def obtener_pagos_cliente_endpoint(
+        id_cliente: int = Query(..., description="ID del cliente"),
         id_entrenador: int | None = Query(None),
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Obtiene el historial de pagos del cliente"""
-    pagos = obtener_pagos_cliente(db, current.id_usuario, id_entrenador)
+    pagos = obtener_pagos_cliente(db, id_cliente, id_entrenador)
 
     total_meses = len(pagos)
     monto_total = sum(p.monto for p in pagos if p.estado == "confirmado")
@@ -115,8 +104,8 @@ def obtener_pagos_cliente_endpoint(
 
 @router.get("/entrenador/ingresos", response_model=List[PagoOut])
 def obtener_ingresos_entrenador_endpoint(
+        id_entrenador: int = Query(..., description="ID del entrenador"),
         estado: str | None = Query(None),
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Obtiene los ingresos (pagos confirmados) del entrenador"""
@@ -128,35 +117,32 @@ def obtener_ingresos_entrenador_endpoint(
         except ValueError:
             raise HTTPException(status_code=400, detail="Estado de pago inválido")
 
-    pagos = obtener_pagos_entrenador(db, current.id_usuario, estado_enum)
+    pagos = obtener_pagos_entrenador(db, id_entrenador, estado_enum)
     return pagos
 
 
 @router.post("/suscripciones", response_model=SuscripcionOut, status_code=status.HTTP_201_CREATED)
 def crear_suscripcion_endpoint(
-        payload: SuscripcionCreate,
-        current: Usuario = Depends(get_current_user),
+        id_cliente: int = Query(..., description="ID del cliente"),
+        payload: SuscripcionCreate = None,
         db: Session = Depends(get_db),
 ):
     """Crea una suscripción del cliente al entrenador"""
-    suscripcion = crear_suscripcion(db, current.id_usuario, payload)
+    if payload is None:
+        raise HTTPException(status_code=400, detail="Body del request es requerido")
+    suscripcion = crear_suscripcion(db, id_cliente, payload)
     return suscripcion
 
 
 @router.get("/suscripciones/{id_suscripcion}", response_model=SuscripcionOut)
 def obtener_suscripcion_endpoint(
         id_suscripcion: int,
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Obtiene detalles de una suscripción"""
     suscripcion = obtener_suscripcion(db, id_suscripcion)
     if not suscripcion:
         raise HTTPException(status_code=404, detail="Suscripción no encontrada")
-
-    if (suscripcion.id_cliente != current.id_usuario and
-            suscripcion.id_entrenador != current.id_usuario):
-        raise HTTPException(status_code=403, detail="No tienes permiso para ver esta suscripción")
 
     return suscripcion
 
@@ -165,16 +151,12 @@ def obtener_suscripcion_endpoint(
 def actualizar_suscripcion_endpoint(
         id_suscripcion: int,
         payload: SuscripcionUpdate,
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Actualiza una suscripción"""
     suscripcion = obtener_suscripcion(db, id_suscripcion)
     if not suscripcion:
         raise HTTPException(status_code=404, detail="Suscripción no encontrada")
-
-    if suscripcion.id_cliente != current.id_usuario:
-        raise HTTPException(status_code=403, detail="No tienes permiso para actualizar esta suscripción")
 
     suscripcion_actualizada = actualizar_suscripcion(db, id_suscripcion, payload)
     return suscripcion_actualizada
@@ -183,7 +165,6 @@ def actualizar_suscripcion_endpoint(
 @router.post("/suscripciones/{id_suscripcion}/cancelar", status_code=status.HTTP_204_NO_CONTENT)
 def cancelar_suscripcion_endpoint(
         id_suscripcion: int,
-        current: Usuario = Depends(get_current_user),
         db: Session = Depends(get_db),
 ):
     """Cancela una suscripción activa"""
@@ -191,28 +172,25 @@ def cancelar_suscripcion_endpoint(
     if not suscripcion:
         raise HTTPException(status_code=404, detail="Suscripción no encontrada")
 
-    if suscripcion.id_cliente != current.id_usuario:
-        raise HTTPException(status_code=403, detail="No tienes permiso para cancelar esta suscripción")
-
     cancelar_suscripcion(db, id_suscripcion)
     return None
 
 
 @router.get("/suscripciones/cliente/activas", response_model=List[SuscripcionOut])
 def obtener_suscripciones_cliente_endpoint(
-        current: Usuario = Depends(get_current_user),
+        id_cliente: int = Query(..., description="ID del cliente"),
         db: Session = Depends(get_db),
 ):
     """Obtiene todas las suscripciones activas del cliente"""
-    suscripciones = obtener_suscripciones_cliente(db, current.id_usuario)
+    suscripciones = obtener_suscripciones_cliente(db, id_cliente)
     return suscripciones
 
 
 @router.get("/suscripciones/entrenador/suscriptores", response_model=List[SuscripcionOut])
 def obtener_suscriptores_endpoint(
-        current: Usuario = Depends(get_current_user),
+        id_entrenador: int = Query(..., description="ID del entrenador"),
         db: Session = Depends(get_db),
 ):
     """Obtiene todos los suscriptores activos del entrenador"""
-    suscripciones = obtener_suscripciones_entrenador(db, current.id_usuario)
+    suscripciones = obtener_suscripciones_entrenador(db, id_entrenador)
     return suscripciones

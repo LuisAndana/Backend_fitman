@@ -26,4 +26,7 @@ __all__ = [
     "AnalisisUsuario",
     "AnalisisPerfil",
     "Progreso",
+
 ]
+
+

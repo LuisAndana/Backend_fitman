@@ -2,6 +2,9 @@
 from pydantic import BaseModel
 from typing import Optional, List
 from datetime import datetime
+from typing import Literal
+
+from routers.ia import PerfilSalud
 
 
 class Ejercicio(BaseModel):
@@ -76,3 +79,13 @@ class ProgresoOut(BaseModel):
 
     class Config:
         from_attributes = True
+
+
+class SolicitudGenerarRutina(BaseModel):
+    id_cliente: int
+    objetivos: str
+    dias: int
+    nivel: str
+    grupo_muscular_foco: Optional[str] = "general"
+    perfil_salud: Optional[PerfilSalud] = None
+    proveedor: Literal["auto", "gemini", "local"] = "auto"

@@ -3,7 +3,8 @@
   "especialidad": "cardio",
   "especialidades": [
     "YOGA",
-    "PILATES"
+    "PILATES",
+    "yo entrene a goku"
   ],
   "experiencia": 22,
   "certificaciones": "ISSA",
@@ -11,7 +12,7 @@
     "Presencial"
   ],
   "ciudad": "Los Mochis",
-  "precio": 500.0,
+  "precio": 400.0,
   "educacion": [
     {
       "titulo": "ingeniero en la uas",

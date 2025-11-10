@@ -1,4 +1,4 @@
-# main.py - VERSIÓN COMPLETA Y FUNCIONAL
+# main.py - VERSIÃ“N COMPLETA Y FUNCIONAL
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,7 +7,8 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import insert, select
-
+from routers.cliente_entrenador import router as cliente_entrenador_router
+import os
 # Utilidades
 from utils.dependencies import get_db
 from models.user import Usuario
@@ -27,7 +28,7 @@ from routers import (
     resenas_router,
     mensajes_router,
     pagos_router,
-    ia_router,
+    ia_router, cliente_entrenador,
 )
 
 import os
@@ -35,13 +36,13 @@ import datetime
 import jwt
 
 # ============================================================
-# CONFIGURACIÓN
+# CONFIGURACIÃ“N
 # ============================================================
 
 app = FastAPI(
     title="FitCoach API",
     version="1.0.0",
-    description="API para gestión de entrenadores y clientes"
+    description="API para gestiÃ³n de entrenadores y clientes"
 )
 
 # CORS
@@ -92,7 +93,7 @@ def make_token(user: Usuario) -> str:
     now = datetime.datetime.utcnow()
     user_id = getattr(user, "id_usuario", None) or getattr(user, "id", None)
     if not user_id:
-        raise HTTPException(status_code=500, detail="Usuario sin ID válido")
+        raise HTTPException(status_code=500, detail="Usuario sin ID vÃ¡lido")
     provider = getattr(user, "auth_provider", None) or "local"
     payload = {
         "sub": str(user_id),
@@ -113,7 +114,7 @@ def _insert_user_core(db: Session, values: dict) -> Usuario:
     forbidden = {"imc"} | computed_cols
     clean = {k: v for k, v in values.items() if k in model_cols and v is not None and k not in forbidden}
     if not clean:
-        raise HTTPException(status_code=500, detail="No hay columnas válidas para insertar")
+        raise HTTPException(status_code=500, detail="No hay columnas vÃ¡lidas para insertar")
     res = db.execute(insert(Usuario.__table__).values(**clean))
     db.commit()
     new_id = getattr(res, "lastrowid", None) or getattr(res, "inserted_primary_key", [None])[0]
@@ -146,16 +147,16 @@ def _coerce_role_value(raw: str | None):
         for m in enum_cls:
             if str(m.value).lower() == norm or m.name.lower() == norm:
                 return m
-        raise HTTPException(status_code=422, detail="Rol inválido. Usa 'alumno' o 'entrenador'.")
+        raise HTTPException(status_code=422, detail="Rol invÃ¡lido. Usa 'alumno' o 'entrenador'.")
     enums = getattr(t, "enums", None)
     if enums:
         if norm is None:
             raise HTTPException(status_code=422, detail="Debes seleccionar un rol.")
         if norm in enums or any(e.lower() == norm for e in enums):
             return next((e for e in enums if e.lower() == norm), norm)
-        raise HTTPException(status_code=422, detail=f"Rol inválido. Permitidos: {', '.join(enums)}.")
+        raise HTTPException(status_code=422, detail=f"Rol invÃ¡lido. Permitidos: {', '.join(enums)}.")
     if norm not in VALID_ROLES:
-        raise HTTPException(status_code=422, detail="Rol inválido. Usa 'alumno' o 'entrenador'.")
+        raise HTTPException(status_code=422, detail="Rol invÃ¡lido. Usa 'alumno' o 'entrenador'.")
     return norm
 
 
@@ -186,17 +187,17 @@ class GoogleCred(BaseModel):
 
 
 # ============================================================
-# LÓGICA DE AUTENTICACIÓN
+# LÃ“GICA DE AUTENTICACIÃ“N
 # ============================================================
 
 def _password_login_logic(payload: LoginCred, db: Session) -> dict:
-    """Lógica de login con email/password"""
+    """LÃ³gica de login con email/password"""
     email = payload.email.strip().lower()
     user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     if _is_google_only(user):
-        raise HTTPException(status_code=400, detail="Esta cuenta está vinculada a Google. Usa 'Continuar con Google'.")
+        raise HTTPException(status_code=400, detail="Esta cuenta estÃ¡ vinculada a Google. Usa 'Continuar con Google'.")
 
     db_pwd = getattr(user, "password", "") or ""
     if isinstance(db_pwd, (bytes, bytearray)):
@@ -210,7 +211,7 @@ def _password_login_logic(payload: LoginCred, db: Session) -> dict:
         db.commit()
         ok = True
     if not ok:
-        raise HTTPException(status_code=401, detail="Contraseña incorrecta.")
+        raise HTTPException(status_code=401, detail="ContraseÃ±a incorrecta.")
 
     if not getattr(user, "auth_provider", None):
         try:
@@ -240,12 +241,12 @@ def _current_user(db: Session = Depends(get_db), Authorization: str | None = Hea
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
-        raise HTTPException(status_code=401, detail="Token inválido")
+        raise HTTPException(status_code=401, detail="Token invÃ¡lido")
     user_id = payload.get("sub")
     try:
         user_id = int(user_id)
     except Exception:
-        raise HTTPException(status_code=401, detail="Token inválido (sub)")
+        raise HTTPException(status_code=401, detail="Token invÃ¡lido (sub)")
     user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.id_usuario == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -253,7 +254,7 @@ def _current_user(db: Session = Depends(get_db), Authorization: str | None = Hea
 
 
 # ============================================================
-# RUTAS DE AUTENTICACIÓN
+# RUTAS DE AUTENTICACIÃ“N
 # ============================================================
 
 from fastapi import APIRouter
@@ -263,7 +264,7 @@ auth_router = APIRouter(prefix="/auth", tags=["Auth"])
 
 @auth_router.post("/login")
 def auth_login(payload: LoginCred, db: Session = Depends(get_db)):
-    """Login con email y contraseña"""
+    """Login con email y contraseÃ±a"""
     return _password_login_logic(payload, db)
 
 
@@ -273,12 +274,12 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
     try:
         info = id_token.verify_oauth2_token(payload.credential, GRequest(), CLIENT_ID)
     except Exception:
-        raise HTTPException(status_code=401, detail="Token de Google inválido")
+        raise HTTPException(status_code=401, detail="Token de Google invÃ¡lido")
 
     sub = info.get("sub")
     email = info.get("email")
     if not email:
-        raise HTTPException(status_code=422, detail="Google no devolvió email")
+        raise HTTPException(status_code=422, detail="Google no devolviÃ³ email")
 
     given = (info.get("given_name") or "").strip()
     family = (info.get("family_name") or "").strip()
@@ -330,7 +331,7 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
         else:
             role_value = _coerce_role_value(payload.rol) if has("rol") else None
             if has("rol") and role_value is None:
-                raise HTTPException(status_code=422, detail="Debes seleccionar un rol válido.")
+                raise HTTPException(status_code=422, detail="Debes seleccionar un rol vÃ¡lido.")
             values = {
                 "email": email,
                 "rol": role_value if has("rol") else None,
@@ -353,7 +354,7 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
             user = _insert_user_core(db, values)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Conflicto de claves únicas.")
+        raise HTTPException(status_code=409, detail="Conflicto de claves Ãºnicas.")
     except HTTPException:
         db.rollback()
         raise
@@ -383,7 +384,7 @@ app.include_router(auth_router)
 # Usuarios
 app.include_router(usuarios_router, tags=["Usuarios"])
 
-# Entrenadores (IMPORTANTE - incluir explícitamente)
+# Entrenadores (IMPORTANTE - incluir explÃ­citamente)
 app.include_router(entrenadores_router, tags=["Entrenadores"])
 
 # Ejercicios
@@ -395,8 +396,8 @@ app.include_router(rutinas_router, prefix="/api/rutinas", tags=["Rutinas"])
 # Asignaciones
 app.include_router(asignaciones_router, prefix="/api/asignaciones", tags=["Asignaciones"])
 
-# Reseñas
-app.include_router(resenas_router, tags=["Reseñas"])
+# ReseÃ±as
+app.include_router(resenas_router, tags=["ReseÃ±as"])
 
 # Mensajes
 app.include_router(mensajes_router, tags=["Mensajes"])
@@ -406,15 +407,15 @@ app.include_router(pagos_router, tags=["Pagos"])
 
 # IA con Gemini
 app.include_router(ia_router, tags=["IA"])
-
-
+app.include_router(cliente_entrenador.router, prefix="/api")
+app.include_router(cliente_entrenador_router, tags=["Cliente-Entrenador"])
 # ============================================================
-# RUTAS BÁSICAS
+# RUTAS BÃSICAS
 # ============================================================
 
 @app.get("/")
 def read_root():
-    """Ruta raíz de la API"""
+    """Ruta raÃ­z de la API"""
     return {
         "nombre": "FitCoach API",
         "version": "1.0.0",
@@ -430,7 +431,7 @@ def health_check():
 
 
 # ============================================================
-# EJECUCIÓN
+# EJECUCIÃ“N
 # ============================================================
 
 if __name__ == "__main__":

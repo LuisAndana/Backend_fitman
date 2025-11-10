@@ -9,7 +9,7 @@ import os
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Optional
 
-import jwt  # PyJWT
+
 from dotenv import load_dotenv, find_dotenv
 
 # ✅ Sin dependencias nativas, sin límite de 72 bytes

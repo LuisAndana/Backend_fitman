@@ -1,101 +1,105 @@
-# dependencies.py
 from __future__ import annotations
-from fastapi import Depends, Header, HTTPException
+from fastapi import Depends, Header, HTTPException, status
 from sqlalchemy.orm import Session, defer
-import os, jwt
-
 from typing import Generator, Optional
-from fastapi import Depends, HTTPException, Request, status
-from sqlalchemy.orm import Session
-from jose import jwt, JWTError
+from jose import jwt
+from jose.exceptions import ExpiredSignatureError, JWTError
 import os
-from config.database import get_db
-from models.user import Usuario
+
 from config.database import SessionLocal
-from utils.security import decode_token, JWT_SECRET, JWT_ALG
 from models.user import Usuario
 
+# Configuración del JWT
+JWT_SECRET = os.getenv("JWT_SECRET", "devsecret")
+JWT_ALG = os.getenv("JWT_ALG", "HS256")
 
+# -------------------------------
+# Sesión de base de datos
+# -------------------------------
 def get_db() -> Generator[Session, None, None]:
-    """
-    Crea una sesión de SQLAlchemy por request y la cierra al finalizar.
-    ¡IMPORTANTE!: usar yield (no return).
-    """
     db = SessionLocal()
     try:
         yield db
     finally:
         db.close()
 
-SECRET = os.getenv("JWT_SECRET", "devsecret")
-ALGO = os.getenv("JWT_ALGO", "HS256")
-
+# -------------------------------
+# Autenticación obligatoria
+# -------------------------------
 def get_current_user(
     db: Session = Depends(get_db),
     Authorization: str | None = Header(None),
 ) -> Usuario:
+    """Obtiene el usuario actual (requiere token válido)"""
     if not Authorization or not Authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Falta header Authorization Bearer")
+        raise HTTPException(
+            status_code=401,
+            detail="Falta header Authorization Bearer",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
 
     token = Authorization.split(" ", 1)[1].strip()
+
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except Exception:
+    except ExpiredSignatureError:
+        raise HTTPException(status_code=401, detail="Token expirado")
+    except JWTError:
         raise HTTPException(status_code=401, detail="Token inválido")
 
-    uid = payload.get("sub")
-    try:
-        uid = int(uid)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Token inválido (sub)")
+    user_id = payload.get("sub")
+    if not user_id:
+        raise HTTPException(status_code=401, detail="Token sin 'sub'")
 
-    # ⚠️ Evita mapear ENUM inválidos
+    try:
+        user_id = int(user_id)
+    except (ValueError, TypeError):
+        raise HTTPException(status_code=401, detail="User ID inválido")
+
     user = (
         db.query(Usuario)
-        .options(defer(Usuario.sexo))   # <— clave
-        .filter(Usuario.id_usuario == uid)
+        .options(defer(Usuario.sexo))
+        .filter(Usuario.id_usuario == user_id)
         .first()
     )
+
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
     return user
 
-    # 2) Decodificar y validar payload
+# -------------------------------
+# Autenticación opcional
+# -------------------------------
+def get_optional_user(
+    db: Session = Depends(get_db),
+    Authorization: Optional[str] = Header(None),
+) -> Optional[Usuario]:
+    """
+    Intenta obtener el usuario actual.
+    Si no hay token o es inválido, devuelve None en lugar de lanzar error.
+    """
+    if not Authorization or not Authorization.lower().startswith("bearer "):
+        return None
+
+    token = Authorization.split(" ", 1)[1].strip()
     try:
-        payload = decode_token(tok)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token inválido",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except (ExpiredSignatureError, JWTError):
+        return None
 
     user_id = payload.get("sub")
-    if user_id is None:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token sin 'sub'",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+    if not user_id:
+        return None
 
-    # 3) Cast seguro a int (por si viene como string)
     try:
-        user_id_int = int(user_id)
-    except Exception:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Identificador de usuario inválido en el token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        user_id = int(user_id)
+    except (ValueError, TypeError):
+        return None
 
-    # 4) Buscar usuario en la BD
-    user = db.get(Usuario, user_id_int)
-    if not user:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Usuario no existe",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-
-    return user
+    return (
+        db.query(Usuario)
+        .options(defer(Usuario.sexo))
+        .filter(Usuario.id_usuario == user_id)
+        .first()
+    )

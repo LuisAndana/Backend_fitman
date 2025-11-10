@@ -1,0 +1,27 @@
+{
+  "resumen": "Soy demasiado bueno pero no tan bueno como el mentado rolando",
+  "especialidad": "fuerza",
+  "especialidades": [
+    "pilates"
+  ],
+  "experiencia": 17,
+  "certificaciones": "Doc. ingenieria ",
+  "modalidades": [
+    "Online"
+  ],
+  "ciudad": "Los Mochis",
+  "precio": 500.0,
+  "educacion": [
+    {
+      "titulo": "diploma en educacion fisisca",
+      "institucion": "SEP",
+      "inicio": "2010",
+      "fin": "2012",
+      "descripcion": "LO MEJOR DEL MUNDO TE PUEDO PONER BIEN MAMADO",
+      "evidenciaUrl": null
+    }
+  ],
+  "diplomas": [],
+  "cursos": [],
+  "logros": []
+}

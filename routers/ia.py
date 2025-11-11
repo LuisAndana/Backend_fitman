@@ -16,14 +16,23 @@ from utils.dependencies import get_db
 router = APIRouter(prefix="/api/ia", tags=["IA"])
 
 # ============================================================
-# CONFIG
+# CONFIG - VERSIÓN ACTUALIZADA
 # ============================================================
 
 # Gemini Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
+GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "models/gemini-2.5-flash")
+GEMINI_VISION_MODEL_ID = os.getenv("GEMINI_VISION_MODEL_ID", "models/gemini-2.5-pro")
+GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "120000"))  # 120 segundos por defecto
+GEMINI_TIMEOUT_SECONDS = GEMINI_TIMEOUT_MS / 1000  # Convertir a segundos
+
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+    print(f"✅ Gemini configurado con modelo: {GEMINI_MODEL}")
+    print(f"📊 Timeout configurado: {GEMINI_TIMEOUT_SECONDS} segundos")
+else:
+    print("⚠️ GEMINI_API_KEY no configurada - usando solo generador local")
 
 # OpenAI Configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -597,121 +606,213 @@ def _build_ai_prompt(perfil: Optional[PerfilSalud], dias: int, nivel: str, objet
     pref = p.preferencias
     home = (pref.lugar or "").lower() == "casa"
     no_equipo = not pref.equipamiento
-    objetivo_primario = objetivos.lower()
 
-    reglas_equipo = []
+    # Construir requisitos de forma concisa
+    requisitos = [f"Nivel: {nivel}", f"Objetivo: {objetivos}", f"{dias} días/semana"]
+
     if home and no_equipo:
-        reglas_equipo.append(
-            "- Si es en casa sin equipamiento, evita máquinas, barras o poleas; usa peso corporal o bandas elásticas.")
+        requisitos.append("Casa sin equipo (peso corporal/bandas)")
     elif home and pref.equipamiento:
-        reglas_equipo.append(
-            f"- Equipamiento disponible: {pref.equipamiento} (no uses máquinas de gimnasio no listadas).")
+        requisitos.append(f"Equipo: {', '.join(pref.equipamiento[:3])}")  # Limitar a 3
 
-    foco_gluteos = ""
-    if "glute" in objetivo_primario or "glúte" in objetivo_primario:
-        foco_gluteos = f"""
-- OBJETIVO PRINCIPAL: GLÚTEOS Y PIERNAS.
-  • Al menos 2–3 días deben enfocarse en tren inferior o glúteos.
-  • Incluye básicos (hip thrust, sentadillas, peso muerto rumano) y accesorios (abducciones, patadas, step-ups, puente de glúteo).
-  • Series y repeticiones orientadas a hipertrofia (4×10-12 reps, 60–90s descanso).
-"""
+    # Perfil simplificado (solo lo esencial)
+    perfil_items = []
+    if p.datos.edad:
+        perfil_items.append(f"Edad: {p.datos.edad}")
+    if p.condiciones:
+        perfil_items.append(f"Condiciones: {', '.join([c.nombre for c in p.condiciones[:2]])}")
+    if p.lesiones:
+        perfil_items.append(f"Lesiones: {', '.join([l.zona for l in p.lesiones[:2]])}")
 
-    # 🧩 Distribución automática por días
-    dist_text = f"""
-El plan debe distribuir los grupos musculares a lo largo de {dias} días de forma equilibrada:
-- Usa el formato push/pull/legs o fullbody, según el nivel ({nivel}).
-- Varía el enfoque cada día: por ejemplo, PECHO/BÍCEPS, ESPALDA/TRÍCEPS, PIERNAS/CORE.
-- Cada día debe tener entre 5 y 7 ejercicios.
-"""
+    perfil_text = ". ".join(perfil_items) if perfil_items else "Sin restricciones"
 
-    # 🧍 Perfil del usuario
-    perfil_text = f"""
-Edad: {p.datos.edad}, Sexo: {p.datos.sexo}, Peso: {p.datos.peso_kg}, Estatura: {p.datos.estatura_cm}
-Condiciones: {[c.nombre for c in p.condiciones]}
-Lesiones: {[l.zona + ':' + l.tipo for l in p.lesiones]}
-Medicaciones: {[m.nombre for m in p.medicaciones]}
-Preferencias: lugar={pref.lugar}, tiempo={pref.tiempo_minutos}min, días_disponibles={pref.dias_disponibles}, objetivos={pref.objetivos}, gustos={pref.gustos}, disgustos={pref.disgustos}
-"""
+    return f"""Crea rutina de {dias} días en JSON.
 
-    return f"""
-Eres un entrenador profesional y debes crear una rutina de entrenamiento personalizada distribuida en {dias} días.
+Requisitos: {' | '.join(requisitos)}
+Usuario: {perfil_text}
 
-Requisitos:
-- Nivel del usuario: {nivel}.
-- Objetivos: {objetivos}.
-{dist_text}
-{foco_gluteos}
-{os.linesep.join(reglas_equipo)}
-
-Formato de salida:
-Devuelve **solo JSON válido** con esta estructura:
-
+JSON (5-6 ejercicios/día):
 {{
-  "nombre": "string",
-  "descripcion": "string",
+  "nombre": "Rutina {nivel} {dias}d",
+  "descripcion": "Enfoque {objetivos}",
   "dias_semana": {dias},
   "minutos_aproximados": {pref.tiempo_minutos or 45},
   "dias": [
     {{
       "numero_dia": 1,
       "nombre_dia": "Lunes",
-      "descripcion": "Día de tren inferior",
-      "grupos_enfoque": ["PIERNAS","GLÚTEOS"],
+      "descripcion": "Push",
+      "grupos_enfoque": ["PECHO","HOMBROS"],
       "ejercicios": [
         {{
           "id_ejercicio": 0,
-          "nombre": "Hip Thrust con peso corporal",
-          "descripcion": "Ejercicio para activar glúteos con pausa de 2s arriba",
-          "grupo_muscular": "PIERNAS",
+          "nombre": "Press banca",
+          "descripcion": "Pecho completo",
+          "grupo_muscular": "PECHO",
           "dificultad": "{nivel}",
           "tipo": "fuerza",
           "series": 4,
-          "repeticiones": 12,
+          "repeticiones": 10,
           "descanso_segundos": 75,
-          "notas": "énfasis glúteos"
+          "notas": null
         }}
       ]
     }}
   ]
 }}
 
-{perfil_text}
-
-⚠️ No incluyas texto adicional fuera del JSON.
-Si no puedes generar la rutina, devuelve un JSON con {{ "error": "no disponible" }}.
-"""
+IMPORTANTE: series, repeticiones y descanso_segundos deben ser NÚMEROS ENTEROS (ej: 10, NO "10-15").
+SOLO JSON válido. Sin texto extra."""
 
 
 # ============================================================
-# AI GENERATORS (GEMINI + OPENAI)
+# AI GENERATORS (GEMINI + OPENAI + GROK) - CON TIMEOUT
 # ============================================================
 
 def _resp_to_text(resp) -> str:
-    # Intenta .text
-    t = getattr(resp, "text", None)
-    if t:
-        return t
+    """
+    Extrae el texto de una respuesta de Gemini con manejo robusto de errores.
+
+    Finish Reasons:
+    - 0: FINISH_REASON_UNSPECIFIED
+    - 1: STOP (éxito)
+    - 2: MAX_TOKENS
+    - 3: SAFETY (bloqueado por seguridad)
+    - 4: RECITATION (bloqueado por contenido repetido)
+    - 5: OTHER
+    """
+    # Intenta .text primero
+    try:
+        t = getattr(resp, "text", None)
+        if t:
+            return t
+    except ValueError as e:
+        # Manejo específico de error de finish_reason
+        if "finish_reason" in str(e).lower():
+            # Extraer finish_reason del mensaje de error
+            import re
+            match = re.search(r'finish_reason.*?(\d+)', str(e))
+            finish_reason = int(match.group(1)) if match else None
+
+            # Obtener prompt_feedback para más detalles
+            prompt_feedback = getattr(resp, "prompt_feedback", None)
+
+            # Construir mensaje de error informativo
+            error_msg = f"Gemini bloqueó la respuesta. "
+
+            if finish_reason == 2:
+                error_msg += "Razón: MAX_TOKENS - La respuesta fue demasiado larga. "
+            elif finish_reason == 3:
+                error_msg += "Razón: SAFETY - Contenido bloqueado por filtros de seguridad. "
+            elif finish_reason == 4:
+                error_msg += "Razón: RECITATION - Contenido bloqueado por repetición. "
+            else:
+                error_msg += f"Razón desconocida (finish_reason={finish_reason}). "
+
+            if prompt_feedback:
+                error_msg += f"Feedback: {prompt_feedback}"
+
+            raise ValueError(error_msg)
 
     # Candidatos (SDKs recientes)
     try:
         cands = getattr(resp, "candidates", None) or []
         if cands:
-            parts = getattr(cands[0], "content", None).parts  # type: ignore
-            if parts:
-                return "".join([getattr(p, "text", "") for p in parts])
-    except Exception:
+            # Verificar finish_reason del candidato
+            finish_reason = getattr(cands[0], "finish_reason", None)
+
+            # Si finish_reason indica un problema, lanzar error específico
+            if finish_reason and finish_reason != 1:  # 1 = STOP (éxito)
+                prompt_feedback = getattr(resp, "prompt_feedback", None)
+
+                error_msg = f"Gemini bloqueó la respuesta (finish_reason={finish_reason}). "
+
+                if finish_reason == 2:
+                    error_msg += "La respuesta fue demasiado larga (MAX_TOKENS)."
+                elif finish_reason == 3:
+                    error_msg += "Contenido bloqueado por filtros de seguridad (SAFETY)."
+                elif finish_reason == 4:
+                    error_msg += "Contenido bloqueado por repetición (RECITATION)."
+
+                if prompt_feedback:
+                    error_msg += f" Feedback: {prompt_feedback}"
+
+                raise ValueError(error_msg)
+
+            # Si finish_reason es OK, intentar extraer el texto
+            content = getattr(cands[0], "content", None)
+            if content:
+                parts = getattr(content, "parts", [])
+                if parts:
+                    return "".join([getattr(p, "text", "") for p in parts])
+    except (AttributeError, IndexError, ValueError) as e:
+        if isinstance(e, ValueError):
+            raise  # Re-lanzar ValueError con mensaje mejorado
         pass
 
-    # Último recurso: str(...)
+    # Último recurso: intentar obtener cualquier información
+    prompt_feedback = getattr(resp, "prompt_feedback", None)
+    if prompt_feedback:
+        raise ValueError(f"Gemini no devolvió contenido válido. Prompt feedback: {prompt_feedback}")
+
     return str(resp)[:2000]
 
 
 def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> Dict[str, Any]:
+    """
+    Genera un plan de entrenamiento usando Gemini AI con timeout configurado.
+
+    Args:
+        perfil: Perfil de salud del usuario
+        dias: Número de días de la rutina
+        nivel: Nivel de dificultad
+        objetivos: Objetivos del entrenamiento
+
+    Returns:
+        Dict con el plan de entrenamiento en formato JSON
+
+    Raises:
+        RuntimeError: Si GEMINI_API_KEY no está configurada o hay errores de cuota
+    """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY no configurada")
 
     prompt = _build_ai_prompt(perfil, dias, nivel, objetivos)
-    generation_config = {"response_mime_type": "application/json", "temperature": 0.2, "max_output_tokens": 1024}
+
+    # Configuración de generación con timeout y máximo de tokens
+    # Se puede configurar desde .env con GEMINI_MAX_OUTPUT_TOKENS
+    max_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
+
+    generation_config = {
+        "response_mime_type": "application/json",
+        "temperature": 0.2,
+        "max_output_tokens": max_tokens  # Máximo: 4096 para gemini-2.5-flash
+    }
+
+    # Configuración de seguridad más permisiva (solo para contenido de fitness)
+    safety_settings = [
+        {
+            "category": "HARM_CATEGORY_HARASSMENT",
+            "threshold": "BLOCK_NONE"
+        },
+        {
+            "category": "HARM_CATEGORY_HATE_SPEECH",
+            "threshold": "BLOCK_NONE"
+        },
+        {
+            "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
+            "threshold": "BLOCK_NONE"
+        },
+        {
+            "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
+            "threshold": "BLOCK_ONLY_HIGH"  # Solo bloquear contenido muy peligroso
+        }
+    ]
+
+    # Configuración de timeout
+    request_options = {
+        "timeout": GEMINI_TIMEOUT_SECONDS  # Usar el timeout configurado
+    }
 
     last_err = None
     tried_models = []
@@ -721,14 +822,41 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
         selected_model = _normalize_model_name(GEMINI_MODEL)
         tried_models.append(selected_model)
         model = genai.GenerativeModel(selected_model)
+
         try:
-            resp = model.generate_content(prompt, generation_config=generation_config)
+            # Intentar con timeout y safety_settings
+            resp = model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                safety_settings=safety_settings,
+                request_options=request_options
+            )
         except TypeError:
-            resp = model.generate_content([prompt], generation_config=generation_config)
+            # Fallback sin request_options si la versión del SDK no lo soporta
+            try:
+                resp = model.generate_content(
+                    [prompt],
+                    generation_config=generation_config,
+                    safety_settings=safety_settings,
+                    request_options=request_options
+                )
+            except TypeError:
+                # Último fallback sin timeout pero con safety_settings
+                try:
+                    resp = model.generate_content(
+                        [prompt],
+                        generation_config=generation_config,
+                        safety_settings=safety_settings
+                    )
+                except TypeError:
+                    # Fallback final sin nada extra
+                    resp = model.generate_content([prompt], generation_config=generation_config)
+
         raw = _resp_to_text(resp)
         if not raw:
             pf = getattr(resp, "prompt_feedback", None)
             raise RuntimeError(f"Gemini devolvió vacío. prompt_feedback={pf}")
+
         try:
             return json.loads(raw)
         except Exception:
@@ -736,25 +864,51 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
             if not m:
                 raise ValueError(f"Gemini no devolvió JSON válido. raw (400): {raw[:400]}...")
             return json.loads(m.group(0))
+
     except Exception as e:
         last_err = e
         # Si NO es un error de cuota, propaga tal cual
         if not _is_quota_error(e):
             raise RuntimeError(
-                f"Fallo en _gemini_generate_plan: {type(e).__name__}: {str(e)} (modelos probados: {tried_models})")
+                f"Fallo en _gemini_generate_plan: {type(e).__name__}: {str(e)} "
+                f"(modelos probados: {tried_models})"
+            )
 
     # 2) Si fue cuota, intenta con modelo ligero (flash) una vez
     try:
         light_model = FALLBACK_LIGHT_MODEL
         tried_models.append(light_model)
         model = genai.GenerativeModel(light_model)
+
         try:
-            resp = model.generate_content(prompt, generation_config=generation_config)
+            resp = model.generate_content(
+                prompt,
+                generation_config=generation_config,
+                safety_settings=safety_settings,
+                request_options=request_options
+            )
         except TypeError:
-            resp = model.generate_content([prompt], generation_config=generation_config)
+            try:
+                resp = model.generate_content(
+                    [prompt],
+                    generation_config=generation_config,
+                    safety_settings=safety_settings,
+                    request_options=request_options
+                )
+            except TypeError:
+                try:
+                    resp = model.generate_content(
+                        [prompt],
+                        generation_config=generation_config,
+                        safety_settings=safety_settings
+                    )
+                except TypeError:
+                    resp = model.generate_content([prompt], generation_config=generation_config)
+
         raw = _resp_to_text(resp)
         if not raw:
             raise RuntimeError("Gemini (flash) devolvió vacío.")
+
         try:
             return json.loads(raw)
         except Exception:
@@ -762,6 +916,7 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
             if not m:
                 raise ValueError("Gemini (flash) no devolvió JSON válido.")
             return json.loads(m.group(0))
+
     except Exception:
         # Propaga el error original de cuota para que el endpoint decida (429/fallback)
         raise RuntimeError(
@@ -867,6 +1022,65 @@ def _grok_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, ob
 # CONVERSION FROM AI TO PYDANTIC
 # ============================================================
 
+def _parse_int_value(value: Any, default: int = 0) -> int:
+    """
+    Parsea un valor a entero, manejando casos especiales como rangos.
+
+    Ejemplos:
+    - "10" → 10
+    - 10 → 10
+    - "10-15" → 10 (toma el valor mínimo)
+    - "8-12" → 8
+    - None → default
+    - "" → default
+    """
+    if value is None or value == "":
+        return default
+
+    # Si ya es un entero
+    if isinstance(value, int):
+        return value
+
+    # Convertir a string y limpiar
+    value_str = str(value).strip()
+
+    # Si contiene un guión (es un rango como "10-15")
+    if '-' in value_str:
+        parts = value_str.split('-')
+        try:
+            # Tomar el primer valor (mínimo del rango)
+            return int(parts[0].strip())
+        except (ValueError, IndexError):
+            return default
+
+    # Si contiene "a" o "to" (ej: "8 a 12", "10 to 15")
+    for separator in [' a ', ' to ', ' - ']:
+        if separator in value_str.lower():
+            parts = value_str.lower().split(separator)
+            try:
+                return int(parts[0].strip())
+            except (ValueError, IndexError):
+                return default
+
+    # Intentar conversión directa
+    try:
+        # Extraer solo números
+        import re
+        numbers = re.findall(r'\d+', value_str)
+        if numbers:
+            return int(numbers[0])
+        return default
+    except (ValueError, TypeError):
+        return default
+
+
+def _parse_series_reps(value: Any, default: int = 10) -> int:
+    """
+    Parsea series o repeticiones, con valores por defecto según tipo.
+    """
+    return _parse_int_value(value, default)
+
+
 def _from_ai_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional[PerfilSalud]) -> (
         List[DiaRutinaDetallado], SeguridadOut):
     dias_py: List[DiaRutinaDetallado] = []
@@ -876,18 +1090,28 @@ def _from_ai_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional
         ejercicios_filtrados, seg_local = validar_filtrar_ejercicios(perfil, ejercicios_in)
         if seg_local.advertencias:
             advertencias.extend([f"{d.get('nombre_dia', 'Día?')}: {a}" for a in seg_local.advertencias])
-        ejercicios_out = [EjercicioRutina(
-            id_ejercicio=int(e.get("id_ejercicio", 0)),
-            nombre=str(e.get("nombre", "")).strip(),
-            descripcion=str(e.get("descripcion", "") or ""),
-            grupo_muscular=str(e.get("grupo_muscular", "GENERAL")).upper(),
-            dificultad=str(e.get("dificultad", nivel_norm)),
-            tipo=str(e.get("tipo", "general")),
-            series=int(e.get("series", 3)),
-            repeticiones=int(e.get("repeticiones", 10)),
-            descanso_segundos=int(e.get("descanso_segundos", 60)),
-            notas=e.get("notas")
-        ) for e in ejercicios_filtrados]
+
+        # Procesar ejercicios con validación robusta
+        ejercicios_out = []
+        for e in ejercicios_filtrados:
+            try:
+                ejercicio = EjercicioRutina(
+                    id_ejercicio=_parse_int_value(e.get("id_ejercicio"), 0),
+                    nombre=str(e.get("nombre", "")).strip() or "Ejercicio sin nombre",
+                    descripcion=str(e.get("descripcion", "") or ""),
+                    grupo_muscular=str(e.get("grupo_muscular", "GENERAL")).upper(),
+                    dificultad=str(e.get("dificultad", nivel_norm)),
+                    tipo=str(e.get("tipo", "general")),
+                    series=_parse_series_reps(e.get("series"), 3),
+                    repeticiones=_parse_series_reps(e.get("repeticiones"), 10),
+                    descanso_segundos=_parse_int_value(e.get("descanso_segundos"), 60),
+                    notas=e.get("notas")
+                )
+                ejercicios_out.append(ejercicio)
+            except Exception as ex:
+                # Si un ejercicio falla, log y continuar con los demás
+                print(f"⚠️ Error procesando ejercicio {e.get('nombre', '?')}: {ex}")
+                continue
 
         dias_py.append(DiaRutinaDetallado(
             numero_dia=int(d.get("numero_dia", len(dias_py) + 1)),
@@ -914,10 +1138,11 @@ def _from_ai_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional
 @router.post("/generar-rutina", response_model=Dict[str, Any])
 def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = Depends(get_db)):
     """
-    Genera una rutina con IA (Gemini/OpenAI) ajustada por perfil de salud.
-    - proveedor="auto"   -> intenta Gemini primero, si falla usa OpenAI, si falla usa local
+    Genera una rutina con IA (Gemini/OpenAI/Grok) ajustada por perfil de salud.
+    - proveedor="auto"   -> intenta Gemini primero, si falla usa OpenAI, si falla usa Grok, si falla usa local
     - proveedor="gemini" -> exige Gemini (si cuota 429, si otro error 502).
     - proveedor="openai" -> exige OpenAI (si error 502).
+    - proveedor="grok"   -> exige Grok (si error 502).
     - proveedor="local"  -> usa generador local directamente.
     """
     try:
@@ -1264,7 +1489,8 @@ def gemini_status():
             "status": "ok",
             "wanted_env": os.getenv("GEMINI_MODEL"),
             "selected_model": selected,
-            "models": models_info
+            "models": models_info,
+            "timeout_seconds": GEMINI_TIMEOUT_SECONDS
         }
     except Exception as e:
         return {"status": "error", "message": str(e)}
@@ -1314,7 +1540,8 @@ def ai_providers_status():
     return {
         "gemini": {
             "configured": bool(GEMINI_API_KEY),
-            "model": GEMINI_MODEL if GEMINI_API_KEY else None
+            "model": GEMINI_MODEL if GEMINI_API_KEY else None,
+            "timeout_seconds": GEMINI_TIMEOUT_SECONDS
         },
         "openai": {
             "configured": bool(OPENAI_API_KEY),

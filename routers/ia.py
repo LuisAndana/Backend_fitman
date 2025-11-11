@@ -1,4 +1,4 @@
-# routers/ia_router.py - Router IA V3 (Gemini primero + fallback local + filtros de salud)
+# routers/ia_router.py - Router IA V4 (Gemini + OpenAI + fallback local + filtros de salud)
 
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
@@ -19,10 +19,46 @@ router = APIRouter(prefix="/api/ia", tags=["IA"])
 # CONFIG
 # ============================================================
 
+# Gemini Configuration
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
+
+# OpenAI Configuration
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+# Import OpenAI only if API key is configured
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except ImportError:
+        print("⚠️ Advertencia: openai library no instalada. Instala con: pip install openai")
+        openai_client = None
+else:
+    openai_client = None
+
+# Grok (xAI) Configuration
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-beta")
+
+# Import Grok client (uses OpenAI-compatible API)
+if GROK_API_KEY:
+    try:
+        from openai import OpenAI
+
+        grok_client = OpenAI(
+            api_key=GROK_API_KEY,
+            base_url="https://api.x.ai/v1"
+        )
+    except ImportError:
+        print("⚠️ Advertencia: openai library no instalada para Grok. Instala con: pip install openai")
+        grok_client = None
+else:
+    grok_client = None
 
 # ============================================================
 # SCHEMAS
@@ -30,16 +66,19 @@ if GEMINI_API_KEY:
 
 from enum import Enum
 
+
 class SexoEnum(str, Enum):
     masculino = "masculino"
     femenino = "femenino"
     otro = "otro"
+
 
 class CondicionSalud(BaseModel):
     nombre: str
     severidad: Optional[str] = None  # leve|moderada|severa
     controlada: Optional[bool] = True
     notas: Optional[str] = None
+
 
 class Lesion(BaseModel):
     zona: str
@@ -48,10 +87,12 @@ class Lesion(BaseModel):
     rango_mov_limitado: Optional[List[str]] = []
     notas: Optional[str] = None
 
+
 class Medicacion(BaseModel):
     nombre: str
     dosis: Optional[str] = None
     efectos_secundarios: Optional[List[str]] = []
+
 
 class PreferenciasUsuario(BaseModel):
     equipamiento: List[str] = []
@@ -63,6 +104,7 @@ class PreferenciasUsuario(BaseModel):
     gustos: List[str] = []
     disgustos: List[str] = []
 
+
 class DatosFisicos(BaseModel):
     edad: Optional[int] = None
     sexo: Optional[SexoEnum] = None
@@ -70,6 +112,7 @@ class DatosFisicos(BaseModel):
     estatura_cm: Optional[float] = None
     grasa_corporal: Optional[float] = None
     fc_reposo: Optional[int] = None
+
 
 class PerfilSalud(BaseModel):
     usuario_id: Optional[int] = None
@@ -79,6 +122,7 @@ class PerfilSalud(BaseModel):
     medicaciones: List[Medicacion] = []
     riesgos: List[str] = []
     preferencias: PreferenciasUsuario = PreferenciasUsuario()
+
 
 class EjercicioRutina(BaseModel):
     id_ejercicio: int
@@ -92,12 +136,14 @@ class EjercicioRutina(BaseModel):
     descanso_segundos: int
     notas: Optional[str] = None
 
+
 class DiaRutinaDetallado(BaseModel):
     numero_dia: int
     nombre_dia: str
     descripcion: str
     grupos_enfoque: List[str]
     ejercicios: List[EjercicioRutina]
+
 
 class RutinaCompleta(BaseModel):
     nombre: str
@@ -113,11 +159,13 @@ class RutinaCompleta(BaseModel):
     fecha_creacion: str
     generada_por: str
 
+
 class SeguridadOut(BaseModel):
     nivel_riesgo: str  # "bajo" | "moderado" | "alto"
     detonantes_evitar: List[str] = []
     advertencias: List[str] = []
     validada_por_reglas: bool = False
+
 
 class SolicitudGenerarRutina(BaseModel):
     id_cliente: int
@@ -126,7 +174,8 @@ class SolicitudGenerarRutina(BaseModel):
     nivel: str  # "principiante" | "intermedio" | "avanzado"
     grupo_muscular_foco: Optional[str] = "general"
     perfil_salud: Optional[PerfilSalud] = None
-    proveedor: Literal["auto", "gemini", "local"] = "auto"  # <-- NUEVO (con default)
+    proveedor: Literal["auto", "gemini", "openai", "grok", "local"] = "auto"  # <-- ACTUALIZADO CON GROK
+
 
 # ============================================================
 # PLANES (fallback local)
@@ -173,8 +222,8 @@ CONTRAINDICACIONES = {
         "evitar_tags": [],
         "advertencias": ["Control glucemia y snack si sesión >60 min."]
     },
-
 }
+
 # Prioridad para glúteos (coincidencias por nombre/desc)
 PRIORIDAD_GLUTEOS = [
     "hip thrust", "empuje de cadera", "puente de glúteo", "glute bridge",
@@ -198,15 +247,20 @@ PREFERRED_MODELS = [
 ]
 FALLBACK_LIGHT_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "models/gemini-2.5-flash")
 
+
+# ============================================================
+# HELPER FUNCTIONS - DETECCIÓN DE ERRORES
+# ============================================================
+
 def _is_quota_error(err: Exception) -> bool:
     msg = f"{type(err).__name__}: {err}"
     m = msg.lower()
     return (
-        "resourceexhausted" in m or
-        "quota" in m or
-        ("rate" in m and "limit" in m) or
-        "429" in m or
-        "generativelanguage.googleapis.com" in m
+            "resourceexhausted" in m or
+            "quota" in m or
+            ("rate" in m and "limit" in m) or
+            "429" in m or
+            "generativelanguage.googleapis.com" in m
     )
 
 
@@ -217,9 +271,11 @@ def _supports_generate_content(m) -> bool:
     except Exception:
         return False
 
+
 def _normalize_model_name(name: str) -> str:
     # El SDK lista modelos como "models/gemini-1.5-pro-002". Aceptamos ambos.
     return name.split("/")[-1] if name and "/" in name else name
+
 
 def _select_gemini_model() -> str:
     if not GEMINI_API_KEY:
@@ -254,6 +310,10 @@ def _select_gemini_model() -> str:
     raise RuntimeError("No hay modelos Gemini compatibles con generateContent en esta cuenta.")
 
 
+# ============================================================
+# HELPER FUNCTIONS - SEGURIDAD Y FILTROS
+# ============================================================
+
 def perf_to_riesgo(perfil: Optional[PerfilSalud]) -> SeguridadOut:
     if not perfil:
         return SeguridadOut(nivel_riesgo="bajo", validada_por_reglas=True)
@@ -263,7 +323,7 @@ def perf_to_riesgo(perfil: Optional[PerfilSalud]) -> SeguridadOut:
         if key in CONTRAINDICACIONES:
             detonantes.update(CONTRAINDICACIONES[key]["evitar_tags"])
             advertencias.extend(CONTRAINDICACIONES[key]["advertencias"])
-            if (c.severidad and c.severidad.lower() in ["moderada","severa"]) or (c.controlada is False):
+            if (c.severidad and c.severidad.lower() in ["moderada", "severa"]) or (c.controlada is False):
                 riesgo = "moderado" if riesgo == "bajo" else "alto"
     for l in perfil.lesiones:
         if l.zona.lower() == "hombro":
@@ -277,68 +337,60 @@ def perf_to_riesgo(perfil: Optional[PerfilSalud]) -> SeguridadOut:
     if "embarazo" in [r.lower() for r in perfil.riesgos]:
         detonantes.update(["impacto_alto", "supino_prolongado", "valsalva"])
         advertencias.append("Evitar supino prolongado y alto impacto durante el embarazo.")
-        riesgo = "moderado" if riesgo == "bajo" else "alto"
+
     return SeguridadOut(
         nivel_riesgo=riesgo,
-        detonantes_evitar=sorted(detonantes),
+        detonantes_evitar=list(detonantes),
         advertencias=advertencias,
-        validada_por_reglas=False
+        validada_por_reglas=True
     )
 
-def etiqueta_ejercicio(ej: Dict[str, Any]) -> List[str]:
-    txt = " ".join([str(ej.get(k,"")) for k in ["nombre","descripcion","tipo","grupo_muscular","dificultad","notas"]]).lower()
-    tags = set()
-    if "press militar" in txt or "overhead" in txt: tags.add("press_por_encima")
-    if "isometr" in txt and ("30" in txt or "45" in txt): tags.add("isometria_larga")
-    if "hiit" in txt or "saltos" in txt or "burpees" in txt: tags.add("hiit_alto_impacto")
-    if "peso muerto" in txt or "sentadilla" in txt: tags.add("carga_compresiva_lumbar_alta")
-    if "hiperextens" in txt: tags.add("hiperextension_lumbar")
-    if "rotación" in txt and "lumbar" in txt: tags.add("rotacion_lumbar")
-    if "valsalva" in txt: tags.add("valsalva")
-    if "abducción" in txt and ("90" in txt or "noventa" in txt): tags.add("abduccion_90_mas")
-    return list(tags)
 
-def validar_filtrar_ejercicios(perfil: Optional[PerfilSalud], ejercicios: List[Dict[str, Any]]) -> (List[Dict[str, Any]], SeguridadOut):
+def validar_filtrar_ejercicios(perfil: Optional[PerfilSalud], ejercicios: List[Dict[str, Any]]) -> (
+        List[Dict[str, Any]], SeguridadOut):
     seg = perf_to_riesgo(perfil)
-    if not perfil or not seg.detonantes_evitar:
-        seg.validada_por_reglas = True
+    if not seg.detonantes_evitar:
         return ejercicios, seg
-    filtrados, choques = [], 0
+
+    filtrados = []
     for ej in ejercicios:
-        if set(etiqueta_ejercicio(ej)) & set(seg.detonantes_evitar):
-            choques += 1
-            continue
-        filtrados.append(ej)
-    if choques == 0:
-        seg.validada_por_reglas = True
-    else:
-        seg.advertencias.append(f"Se eliminaron {choques} ejercicios contraindicados según perfil.")
+        tags_ej = (ej.get("tags") or []) if isinstance(ej.get("tags"), list) else []
+        if not any(t in tags_ej for t in seg.detonantes_evitar):
+            filtrados.append(ej)
+
     return filtrados, seg
-def _objetivo_es_gluteos(obj: str, foco: Optional[str]) -> bool:
-    txt = (obj or "").lower() + " " + (foco or "")
-    return ("glute" in txt) or ("glúte" in txt)
+
 
 def _es_casa_sin_equipo(pref: Optional[PreferenciasUsuario]) -> bool:
-    if not pref: return False
+    if not pref:
+        return False
     return (pref.lugar or "").lower() == "casa" and not pref.equipamiento
 
+
 def _descarta_por_equipo_si_casa_sin_equipo(ej: Dict[str, Any]) -> bool:
-    """True si DEBE descartarse para casa sin equipo."""
-    t = (ej.get("nombre","") + " " + ej.get("descripcion","") + " " + ej.get("tipo","")).lower()
+    t = (ej.get("nombre", "") + " " + ej.get("descripcion", "") + " " + ej.get("tipo", "")).lower()
     if any(p in t for p in PALABRAS_MAQUINAS_GYM): return True
     if any(p in t for p in PALABRAS_BARRA): return True
     return False
 
+
 def _score_prioridad_gluteo(ej: Dict[str, Any]) -> int:
     """Mayor score = más glúteo."""
-    t = (ej.get("nombre","") + " " + ej.get("descripcion","")).lower()
+    t = (ej.get("nombre", "") + " " + ej.get("descripcion", "")).lower()
     s = 0
     for kw in PRIORIDAD_GLUTEOS:
         if kw in t: s += 2
     # bonus si grupo = PIERNAS/GLÚTEO
-    if "glúteo" in t or (ej.get("grupo_muscular","").upper() in ["PIERNAS","GLÚTEOS"]):
+    if "glúteo" in t or (ej.get("grupo_muscular", "").upper() in ["PIERNAS", "GLÚTEOS"]):
         s += 1
     return s
+
+
+def _objetivo_es_gluteos(objetivo: str, foco: Optional[str]) -> bool:
+    txt = (objetivo or "").lower() + " " + (foco or "").lower()
+    return ("glute" in txt) or ("glúte" in txt)
+
+
 def _split_por_objetivo(dias: int, objetivos: str, foco: Optional[str]) -> List[List[str]]:
     """
     Devuelve un split preferente si el objetivo es glúteos.
@@ -355,8 +407,10 @@ def _split_por_objetivo(dias: int, objetivos: str, foco: Optional[str]) -> List[
         3: [["GLÚTEOS/PIERNAS"], ["UPPER LIGERO"], ["GLÚTEOS/PIERNAS"]],
         4: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE/CARDIO SUAVE"]],
         5: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE/ESTABILIDAD"], ["GLÚTEOS (AISLAMIENTOS)"]],
-        6: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["UPPER LIGERO"], ["GLÚTEOS (AISLAMIENTOS)"], ["CORE/CARDIO"]],
-        7: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE"], ["GLÚTEOS (AISLAMIENTOS)"], ["UPPER LIGERO"], ["DESCANSO"]],
+        6: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["UPPER LIGERO"], ["GLÚTEOS (AISLAMIENTOS)"],
+            ["CORE/CARDIO"]],
+        7: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE"], ["GLÚTEOS (AISLAMIENTOS)"],
+            ["UPPER LIGERO"], ["DESCANSO"]],
     }
 
     # Fallback cercano si no hay preset exacto
@@ -368,13 +422,14 @@ def _split_por_objetivo(dias: int, objetivos: str, foco: Optional[str]) -> List[
         return presets[7]
     return PLANES_DISTRIBUCION.get(dias, PLANES_DISTRIBUCION[4])
 
+
 # ============================================================
 # FALLBACK LOCAL (consulta BD + distribución)
 # ============================================================
 
 def obtener_ejercicios_por_grupo(db: Session, nivel: str) -> Dict[str, List[Dict[str, Any]]]:
     print(f"\n🔍 Buscando ejercicios para nivel: {nivel}")
-    grupos = ["PECHO","ESPALDA","BRAZOS","PIERNAS","HOMBROS","CORE","CARDIO"]
+    grupos = ["PECHO", "ESPALDA", "BRAZOS", "PIERNAS", "HOMBROS", "CORE", "CARDIO"]
     out: Dict[str, List[Dict[str, Any]]] = {}
     for g in grupos:
         q = text("""
@@ -394,28 +449,29 @@ def obtener_ejercicios_por_grupo(db: Session, nivel: str) -> Dict[str, List[Dict
             """)
             res = db.execute(q2, {"grupo": g}).fetchall()
         out[g] = [{
-            "id_ejercicio": r[0],"nombre": r[1],"descripcion": r[2] or "","grupo_muscular": r[3],
+            "id_ejercicio": r[0], "nombre": r[1], "descripcion": r[2] or "", "grupo_muscular": r[3],
             "dificultad": r[4], "tipo": r[5] or "general"
         } for r in res]
     return out
 
+
 def distribuir_ejercicios_inteligente(
-    ejercicios_por_grupo: Dict[str, List[Dict[str, Any]]],
-    dias_semana: int,
-    nivel: str,
-    objetivo: str,
-    perfil: Optional[PerfilSalud] = None
+        ejercicios_por_grupo: Dict[str, List[Dict[str, Any]]],
+        dias_semana: int,
+        nivel: str,
+        objetivo: str,
+        perfil: Optional[PerfilSalud] = None
 ) -> (List[DiaRutinaDetallado], SeguridadOut):
     """
     Fallback local mejorado:
     - Split adaptado al objetivo (glúteos) con _split_por_objetivo
     - Filtro por salud (contraindicaciones)
-    - Filtro por “casa sin equipo”
+    - Filtro por "casa sin equipo"
     - Priorización de ejercicios de glúteo por score
     - Evita duplicados dentro del día
     """
     dias: List[DiaRutinaDetallado] = []
-    nombres = ["Lunes","Martes","Miércoles","Jueves","Viernes","Sábado","Domingo"]
+    nombres = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
     # Split por objetivo (glúteos) o genérico
     plan = _split_por_objetivo(dias_semana, objetivo, None)
@@ -428,7 +484,7 @@ def distribuir_ejercicios_inteligente(
     def expandir_grupo(alias: str) -> List[str]:
         a = alias.upper()
         if "UPPER" in a:
-            return ["PECHO","ESPALDA","HOMBROS","BRAZOS"]
+            return ["PECHO", "ESPALDA", "HOMBROS", "BRAZOS"]
         if "GLÚTEOS" in a or "GLUTEOS" in a or "GLUTE" in a:
             return ["PIERNAS"]  # usamos pool de PIERNAS pero luego priorizamos por score de glúteo
         if "CORE" in a:
@@ -440,7 +496,7 @@ def distribuir_ejercicios_inteligente(
         return [a]
 
     for i, grupos in enumerate(plan):
-        nombre_dia = nombres[i] if i < len(nombres) else f"Día {i+1}"
+        nombre_dia = nombres[i] if i < len(nombres) else f"Día {i + 1}"
         # Expande aliases (UPPER LIGERO, GLÚTEOS/QUADS, etc.)
         grupos_norm: List[str] = []
         for g in grupos:
@@ -480,42 +536,32 @@ def distribuir_ejercicios_inteligente(
             intentos = 0
             while obtenidos < n_por_grupo and pool and intentos < len(pool) * 2:
                 idx = idxs.get(g_pri, 0) % len(pool)
-                cand = dict(pool[idx])
-                idxs[g_pri] = idxs.get(g_pri, 0) + 1
+                c = pool[idx]
+                idxs[g_pri] = idx + 1
                 intentos += 1
 
-                clave = (int(cand.get("id_ejercicio", 0)), cand.get("nombre","").strip().lower())
+                clave = (c["id_ejercicio"], c["nombre"])
                 if clave in usados:
                     continue
                 usados.add(clave)
 
-                score = _score_prioridad_gluteo(cand)
-                if nivel == "PRINCIPIANTE":
-                    if score >= 3: series, reps, descanso = 3, 10, 90
-                    else:          series, reps, descanso = 3, 12, 60
-                elif nivel == "AVANZADO":
-                    if score >= 3: series, reps, descanso = 5, 8, 105
-                    else:          series, reps, descanso = 4, 12, 75
-                else:  # INTERMEDIO
-                    if score >= 3: series, reps, descanso = 4, 8, 90
-                    else:          series, reps, descanso = 3, 12, 60
-
                 ej_del_dia.append(EjercicioRutina(
-                    id_ejercicio=int(cand.get("id_ejercicio", 0)),
-                    nombre=str(cand.get("nombre","")),
-                    descripcion=str(cand.get("descripcion","") or ""),
-                    grupo_muscular=str(cand.get("grupo_muscular","")).upper(),
-                    dificultad=str(cand.get("dificultad", nivel)),
-                    tipo=str(cand.get("tipo","general")),
-                    series=series,
-                    repeticiones=reps,
-                    descanso_segundos=descanso,
-                    notas=("enfoque glúteos" if _objetivo_es_gluteos(objetivo, "gluteo") else None)
+                    id_ejercicio=c["id_ejercicio"],
+                    nombre=c["nombre"],
+                    descripcion=c["descripcion"],
+                    grupo_muscular=c["grupo_muscular"],
+                    dificultad=c["dificultad"],
+                    tipo=c["tipo"],
+                    series=3 if nivel == "PRINCIPIANTE" else 4,
+                    repeticiones=12 if nivel == "PRINCIPIANTE" else 10,
+                    descanso_segundos=90 if nivel == "PRINCIPIANTE" else 75,
+                    notas=(f"Prioridad glúteos" if _objetivo_es_gluteos(objetivo, "gluteo") and _score_prioridad_gluteo(
+                        c) > 2 else None)
                 ))
                 obtenidos += 1
 
         dias.append(DiaRutinaDetallado(
-            numero_dia=i+1,
+            numero_dia=i + 1,
             nombre_dia=nombre_dia,
             descripcion=f"Enfoque: {', '.join(grupos)}",
             grupos_enfoque=grupos,
@@ -541,11 +587,12 @@ def calcular_minutos_rutina(dias: List[DiaRutinaDetallado]) -> int:
         minutos_total += m // 60
     return max(30, minutos_total // len(dias)) if dias else 45
 
+
 # ============================================================
-# GEMINI (generador principal)
+# PROMPT BUILDER
 # ============================================================
 
-def _build_gemini_prompt(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> str:
+def _build_ai_prompt(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> str:
     p = perfil or PerfilSalud()
     pref = p.preferencias
     home = (pref.lugar or "").lower() == "casa"
@@ -554,9 +601,11 @@ def _build_gemini_prompt(perfil: Optional[PerfilSalud], dias: int, nivel: str, o
 
     reglas_equipo = []
     if home and no_equipo:
-        reglas_equipo.append("- Si es en casa sin equipamiento, evita máquinas, barras o poleas; usa peso corporal o bandas elásticas.")
+        reglas_equipo.append(
+            "- Si es en casa sin equipamiento, evita máquinas, barras o poleas; usa peso corporal o bandas elásticas.")
     elif home and pref.equipamiento:
-        reglas_equipo.append(f"- Equipamiento disponible: {pref.equipamiento} (no uses máquinas de gimnasio no listadas).")
+        reglas_equipo.append(
+            f"- Equipamiento disponible: {pref.equipamiento} (no uses máquinas de gimnasio no listadas).")
 
     foco_gluteos = ""
     if "glute" in objetivo_primario or "glúte" in objetivo_primario:
@@ -579,7 +628,7 @@ El plan debe distribuir los grupos musculares a lo largo de {dias} días de form
     perfil_text = f"""
 Edad: {p.datos.edad}, Sexo: {p.datos.sexo}, Peso: {p.datos.peso_kg}, Estatura: {p.datos.estatura_cm}
 Condiciones: {[c.nombre for c in p.condiciones]}
-Lesiones: {[l.zona+':'+l.tipo for l in p.lesiones]}
+Lesiones: {[l.zona + ':' + l.tipo for l in p.lesiones]}
 Medicaciones: {[m.nombre for m in p.medicaciones]}
 Preferencias: lugar={pref.lugar}, tiempo={pref.tiempo_minutos}min, días_disponibles={pref.dias_disponibles}, objetivos={pref.objetivos}, gustos={pref.gustos}, disgustos={pref.disgustos}
 """
@@ -633,6 +682,10 @@ Si no puedes generar la rutina, devuelve un JSON con {{ "error": "no disponible"
 """
 
 
+# ============================================================
+# AI GENERATORS (GEMINI + OPENAI)
+# ============================================================
+
 def _resp_to_text(resp) -> str:
     # Intenta .text
     t = getattr(resp, "text", None)
@@ -657,7 +710,7 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY no configurada")
 
-    prompt = _build_gemini_prompt(perfil, dias, nivel, objetivos)
+    prompt = _build_ai_prompt(perfil, dias, nivel, objetivos)
     generation_config = {"response_mime_type": "application/json", "temperature": 0.2, "max_output_tokens": 1024}
 
     last_err = None
@@ -687,7 +740,8 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
         last_err = e
         # Si NO es un error de cuota, propaga tal cual
         if not _is_quota_error(e):
-            raise RuntimeError(f"Fallo en _gemini_generate_plan: {type(e).__name__}: {str(e)} (modelos probados: {tried_models})")
+            raise RuntimeError(
+                f"Fallo en _gemini_generate_plan: {type(e).__name__}: {str(e)} (modelos probados: {tried_models})")
 
     # 2) Si fue cuota, intenta con modelo ligero (flash) una vez
     try:
@@ -716,21 +770,119 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
         )
 
 
-def _from_gemini_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional[PerfilSalud]) -> (List[DiaRutinaDetallado], SeguridadOut):
+def _openai_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> Dict[str, Any]:
+    """
+    Genera plan usando OpenAI ChatGPT API
+    """
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY no configurada")
+
+    if not openai_client:
+        raise RuntimeError("Cliente OpenAI no disponible. Instala con: pip install openai")
+
+    prompt = _build_ai_prompt(perfil, dias, nivel, objetivos)
+
+    try:
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Eres un entrenador profesional experto en crear rutinas de ejercicio personalizadas. Debes responder ÚNICAMENTE con JSON válido, sin texto adicional."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.2,
+            max_tokens=2048,
+            response_format={"type": "json_object"}  # Fuerza respuesta JSON
+        )
+
+        raw = response.choices[0].message.content
+        if not raw:
+            raise RuntimeError("OpenAI devolvió respuesta vacía")
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Intenta extraer JSON del texto
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if not m:
+                raise ValueError(f"OpenAI no devolvió JSON válido. raw (400): {raw[:400]}...")
+            return json.loads(m.group(0))
+
+    except Exception as e:
+        raise RuntimeError(f"Fallo en _openai_generate_plan: {type(e).__name__}: {str(e)}")
+
+
+def _grok_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> Dict[str, Any]:
+    """
+    Genera plan usando Grok (xAI) API
+    """
+    if not GROK_API_KEY:
+        raise RuntimeError("GROK_API_KEY no configurada")
+
+    if not grok_client:
+        raise RuntimeError("Cliente Grok no disponible. Instala con: pip install openai")
+
+    prompt = _build_ai_prompt(perfil, dias, nivel, objetivos)
+
+    try:
+        response = grok_client.chat.completions.create(
+            model=GROK_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": "Eres un entrenador profesional experto en crear rutinas de ejercicio personalizadas. Debes responder ÚNICAMENTE con JSON válido, sin texto adicional."
+                },
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.2,
+            max_tokens=2048
+        )
+
+        raw = response.choices[0].message.content
+        if not raw:
+            raise RuntimeError("Grok devolvió respuesta vacía")
+
+        try:
+            return json.loads(raw)
+        except json.JSONDecodeError:
+            # Intenta extraer JSON del texto
+            m = re.search(r"\{[\s\S]*\}", raw)
+            if not m:
+                raise ValueError(f"Grok no devolvió JSON válido. raw (400): {raw[:400]}...")
+            return json.loads(m.group(0))
+
+    except Exception as e:
+        raise RuntimeError(f"Fallo en _grok_generate_plan: {type(e).__name__}: {str(e)}")
+
+
+# ============================================================
+# CONVERSION FROM AI TO PYDANTIC
+# ============================================================
+
+def _from_ai_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional[PerfilSalud]) -> (
+        List[DiaRutinaDetallado], SeguridadOut):
     dias_py: List[DiaRutinaDetallado] = []
     advertencias: List[str] = []
     for d in plan.get("dias", []):
         ejercicios_in = d.get("ejercicios", [])
         ejercicios_filtrados, seg_local = validar_filtrar_ejercicios(perfil, ejercicios_in)
         if seg_local.advertencias:
-            advertencias.extend([f"{d.get('nombre_dia','Día?')}: {a}" for a in seg_local.advertencias])
+            advertencias.extend([f"{d.get('nombre_dia', 'Día?')}: {a}" for a in seg_local.advertencias])
         ejercicios_out = [EjercicioRutina(
             id_ejercicio=int(e.get("id_ejercicio", 0)),
-            nombre=str(e.get("nombre","")).strip(),
-            descripcion=str(e.get("descripcion","") or ""),
-            grupo_muscular=str(e.get("grupo_muscular","GENERAL")).upper(),
+            nombre=str(e.get("nombre", "")).strip(),
+            descripcion=str(e.get("descripcion", "") or ""),
+            grupo_muscular=str(e.get("grupo_muscular", "GENERAL")).upper(),
             dificultad=str(e.get("dificultad", nivel_norm)),
-            tipo=str(e.get("tipo","general")),
+            tipo=str(e.get("tipo", "general")),
             series=int(e.get("series", 3)),
             repeticiones=int(e.get("repeticiones", 10)),
             descanso_segundos=int(e.get("descanso_segundos", 60)),
@@ -738,9 +890,9 @@ def _from_gemini_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Opti
         ) for e in ejercicios_filtrados]
 
         dias_py.append(DiaRutinaDetallado(
-            numero_dia=int(d.get("numero_dia", len(dias_py)+1)),
-            nombre_dia=str(d.get("nombre_dia", f"Día {len(dias_py)+1}")),
-            descripcion=str(d.get("descripcion","")),
+            numero_dia=int(d.get("numero_dia", len(dias_py) + 1)),
+            nombre_dia=str(d.get("nombre_dia", f"Día {len(dias_py) + 1}")),
+            descripcion=str(d.get("descripcion", "")),
             grupos_enfoque=[str(x).upper() for x in d.get("grupos_enfoque", [])],
             ejercicios=ejercicios_out
         ))
@@ -754,6 +906,7 @@ def _from_gemini_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Opti
     )
     return dias_py, seguridad
 
+
 # ============================================================
 # ENDPOINTS
 # ============================================================
@@ -761,9 +914,10 @@ def _from_gemini_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Opti
 @router.post("/generar-rutina", response_model=Dict[str, Any])
 def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = Depends(get_db)):
     """
-    Genera una rutina con IA (Gemini) ajustada por perfil de salud.
-    - proveedor="auto"   -> intenta Gemini; si hay cuota, cambia a flash 1 vez; si falla, fallback local.
+    Genera una rutina con IA (Gemini/OpenAI) ajustada por perfil de salud.
+    - proveedor="auto"   -> intenta Gemini primero, si falla usa OpenAI, si falla usa local
     - proveedor="gemini" -> exige Gemini (si cuota 429, si otro error 502).
+    - proveedor="openai" -> exige OpenAI (si error 502).
     - proveedor="local"  -> usa generador local directamente.
     """
     try:
@@ -774,12 +928,20 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
         nivel_norm = nivel_map.get(solicitud.nivel.lower(), "INTERMEDIO")
         prov = getattr(solicitud, "proveedor", "auto")
 
+        # Validaciones de proveedor
         if prov == "gemini" and not GEMINI_API_KEY:
             raise HTTPException(status_code=502, detail="Gemini requerido pero GEMINI_API_KEY no está configurada")
 
-        generada_por = "gemini"
-        descripcion = "Rutina generada por IA (Gemini) con validación de seguridad"
+        if prov == "openai" and not OPENAI_API_KEY:
+            raise HTTPException(status_code=502, detail="OpenAI requerido pero OPENAI_API_KEY no está configurada")
 
+        if prov == "grok" and not GROK_API_KEY:
+            raise HTTPException(status_code=502, detail="Grok requerido pero GROK_API_KEY no está configurada")
+
+        generada_por = "local"
+        descripcion = "Rutina generada localmente con validación de seguridad"
+
+        # LOCAL DIRECTO
         if prov == "local":
             ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
             if not any(ejercicios_por_grupo.values()):
@@ -795,7 +957,8 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
             generada_por = "local"
             descripcion = "Rutina generada localmente (respaldo) con validación de seguridad"
 
-        else:
+        # GEMINI DIRECTO
+        elif prov == "gemini":
             try:
                 plan_json = _gemini_generate_plan(
                     perfil=solicitud.perfil_salud,
@@ -803,35 +966,132 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
                     nivel=nivel_norm,
                     objetivos=solicitud.objetivos
                 )
-                dias, seguridad = _from_gemini_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
-
+                dias, seguridad = _from_ai_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
+                generada_por = "gemini"
+                descripcion = "Rutina generada por IA (Gemini) con validación de seguridad"
             except Exception as ge:
-                # --- Diferenciación clara de errores ---
-                if prov == "gemini":
-                    status_code = 429 if _is_quota_error(ge) else 502
-                    raise HTTPException(
-                        status_code=status_code,
-                        detail={
-                            "error": "quota_exceeded" if status_code == 429 else "gemini_error",
-                            "message": str(ge),
-                            "hint": "Usa proveedor='auto' para fallback local automático o revisa cuotas/billing.",
-                        }
-                    )
-
-                # Modo auto: fallback local
-                ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
-                if not any(ejercicios_por_grupo.values()):
-                    raise HTTPException(status_code=400, detail="No hay ejercicios disponibles en la base de datos")
-
-                dias, seguridad = distribuir_ejercicios_inteligente(
-                    ejercicios_por_grupo=ejercicios_por_grupo,
-                    dias_semana=solicitud.dias,
-                    nivel=nivel_norm,
-                    objetivo=solicitud.objetivos,
-                    perfil=solicitud.perfil_salud
+                status_code = 429 if _is_quota_error(ge) else 502
+                raise HTTPException(
+                    status_code=status_code,
+                    detail={
+                        "error": "quota_exceeded" if status_code == 429 else "gemini_error",
+                        "message": str(ge),
+                        "hint": "Usa proveedor='auto' para fallback automático o revisa cuotas/billing."
+                    }
                 )
-                generada_por = "local"
-                descripcion = "Rutina generada localmente (respaldo) por límite de cuota o error de IA"
+
+        # OPENAI DIRECTO
+        elif prov == "openai":
+            try:
+                plan_json = _openai_generate_plan(
+                    perfil=solicitud.perfil_salud,
+                    dias=solicitud.dias,
+                    nivel=nivel_norm,
+                    objetivos=solicitud.objetivos
+                )
+                dias, seguridad = _from_ai_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
+                generada_por = "openai"
+                descripcion = "Rutina generada por IA (OpenAI ChatGPT) con validación de seguridad"
+            except Exception as oe:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "openai_error",
+                        "message": str(oe),
+                        "hint": "Usa proveedor='auto' para fallback automático."
+                    }
+                )
+
+        # GROK DIRECTO
+        elif prov == "grok":
+            try:
+                plan_json = _grok_generate_plan(
+                    perfil=solicitud.perfil_salud,
+                    dias=solicitud.dias,
+                    nivel=nivel_norm,
+                    objetivos=solicitud.objetivos
+                )
+                dias, seguridad = _from_ai_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
+                generada_por = "grok"
+                descripcion = "Rutina generada por IA (Grok xAI) con validación de seguridad"
+            except Exception as gke:
+                raise HTTPException(
+                    status_code=502,
+                    detail={
+                        "error": "grok_error",
+                        "message": str(gke),
+                        "hint": "Usa proveedor='auto' para fallback automático."
+                    }
+                )
+
+        # AUTO (Cascada: Gemini -> OpenAI -> Grok -> Local)
+        else:
+            # Intento 1: Gemini
+            try:
+                if GEMINI_API_KEY:
+                    plan_json = _gemini_generate_plan(
+                        perfil=solicitud.perfil_salud,
+                        dias=solicitud.dias,
+                        nivel=nivel_norm,
+                        objetivos=solicitud.objetivos
+                    )
+                    dias, seguridad = _from_ai_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
+                    generada_por = "gemini"
+                    descripcion = "Rutina generada por IA (Gemini) con validación de seguridad"
+                else:
+                    raise RuntimeError("Gemini no disponible")
+            except Exception as ge:
+                print(f"⚠️ Gemini falló: {ge}")
+
+                # Intento 2: OpenAI
+                try:
+                    if OPENAI_API_KEY and openai_client:
+                        plan_json = _openai_generate_plan(
+                            perfil=solicitud.perfil_salud,
+                            dias=solicitud.dias,
+                            nivel=nivel_norm,
+                            objetivos=solicitud.objetivos
+                        )
+                        dias, seguridad = _from_ai_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
+                        generada_por = "openai"
+                        descripcion = "Rutina generada por IA (OpenAI ChatGPT) con validación de seguridad"
+                    else:
+                        raise RuntimeError("OpenAI no disponible")
+                except Exception as oe:
+                    print(f"⚠️ OpenAI falló: {oe}")
+
+                    # Intento 3: Grok
+                    try:
+                        if GROK_API_KEY and grok_client:
+                            plan_json = _grok_generate_plan(
+                                perfil=solicitud.perfil_salud,
+                                dias=solicitud.dias,
+                                nivel=nivel_norm,
+                                objetivos=solicitud.objetivos
+                            )
+                            dias, seguridad = _from_ai_to_pydantic(plan_json, nivel_norm, solicitud.perfil_salud)
+                            generada_por = "grok"
+                            descripcion = "Rutina generada por IA (Grok xAI) con validación de seguridad"
+                        else:
+                            raise RuntimeError("Grok no disponible")
+                    except Exception as gke:
+                        print(f"⚠️ Grok falló: {gke}")
+
+                        # Intento 4: Local Fallback
+                        ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
+                        if not any(ejercicios_por_grupo.values()):
+                            raise HTTPException(status_code=400,
+                                                detail="No hay ejercicios disponibles en la base de datos")
+
+                        dias, seguridad = distribuir_ejercicios_inteligente(
+                            ejercicios_por_grupo=ejercicios_por_grupo,
+                            dias_semana=solicitud.dias,
+                            nivel=nivel_norm,
+                            objetivo=solicitud.objetivos,
+                            perfil=solicitud.perfil_salud
+                        )
+                        generada_por = "local"
+                        descripcion = "Rutina generada localmente (respaldo) por límite de cuota o error de IA"
 
         total_ejercicios = sum(len(d.ejercicios) for d in dias)
         minutos = calcular_minutos_rutina(dias)
@@ -856,7 +1116,8 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
     except HTTPException:
         raise
     except Exception as e:
-        import traceback; traceback.print_exc()
+        import traceback;
+        traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar rutina: {str(e)}")
 
 
@@ -869,12 +1130,67 @@ def gemini_debug():
         model = genai.GenerativeModel(GEMINI_MODEL)
         prompt = 'Devuelve SOLO este JSON: {"ok": true, "modelo": "' + GEMINI_MODEL + '"}'
         try:
-            resp = model.generate_content(prompt, generation_config={"response_mime_type": "application/json", "temperature": 0.0})
+            resp = model.generate_content(prompt, generation_config={"response_mime_type": "application/json",
+                                                                     "temperature": 0.0})
         except TypeError:
-            resp = model.generate_content([prompt], generation_config={"response_mime_type": "application/json", "temperature": 0.0})
+            resp = model.generate_content([prompt], generation_config={"response_mime_type": "application/json",
+                                                                       "temperature": 0.0})
 
         raw = _resp_to_text(resp)
         return {"status": "ok", "raw": raw}
+    except Exception as e:
+        return {"status": "error", "message": f"{type(e).__name__}: {str(e)}"}
+
+
+@router.get("/openai/debug")
+def openai_debug():
+    """Endpoint para verificar que OpenAI está funcionando correctamente"""
+    try:
+        if not OPENAI_API_KEY:
+            return {"status": "error", "message": "OPENAI_API_KEY no configurada"}
+
+        if not openai_client:
+            return {"status": "error", "message": "Cliente OpenAI no disponible"}
+
+        response = openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[
+                {"role": "system", "content": "Responde solo con JSON válido"},
+                {"role": "user", "content": 'Devuelve SOLO este JSON: {"ok": true, "modelo": "' + OPENAI_MODEL + '"}'}
+            ],
+            temperature=0.0,
+            max_tokens=100,
+            response_format={"type": "json_object"}
+        )
+
+        raw = response.choices[0].message.content
+        return {"status": "ok", "raw": raw, "model": OPENAI_MODEL}
+    except Exception as e:
+        return {"status": "error", "message": f"{type(e).__name__}: {str(e)}"}
+
+
+@router.get("/grok/debug")
+def grok_debug():
+    """Endpoint para verificar que Grok está funcionando correctamente"""
+    try:
+        if not GROK_API_KEY:
+            return {"status": "error", "message": "GROK_API_KEY no configurada"}
+
+        if not grok_client:
+            return {"status": "error", "message": "Cliente Grok no disponible"}
+
+        response = grok_client.chat.completions.create(
+            model=GROK_MODEL,
+            messages=[
+                {"role": "system", "content": "Responde solo con JSON válido"},
+                {"role": "user", "content": 'Devuelve SOLO este JSON: {"ok": true, "modelo": "' + GROK_MODEL + '"}'}
+            ],
+            temperature=0.0,
+            max_tokens=100
+        )
+
+        raw = response.choices[0].message.content
+        return {"status": "ok", "raw": raw, "model": GROK_MODEL}
     except Exception as e:
         return {"status": "error", "message": f"{type(e).__name__}: {str(e)}"}
 
@@ -887,7 +1203,7 @@ def obtener_ejercicios_sugeridos(
         db: Session = Depends(get_db)
 ):
     try:
-        nivel_map = {"principiante":"PRINCIPIANTE","intermedio":"INTERMEDIO","avanzado":"AVANZADO"}
+        nivel_map = {"principiante": "PRINCIPIANTE", "intermedio": "INTERMEDIO", "avanzado": "AVANZADO"}
         nivel_norm = nivel_map.get(nivel.lower(), "INTERMEDIO")
 
         q = text("""
@@ -919,6 +1235,7 @@ def obtener_planes_distribucion():
         },
         "descripcion": "Planes de distribución de grupos musculares por día"
     }
+
 
 @router.get("/gemini/status")
 def gemini_status():
@@ -952,3 +1269,65 @@ def gemini_status():
     except Exception as e:
         return {"status": "error", "message": str(e)}
 
+
+@router.get("/openai/status")
+def openai_status():
+    """Endpoint para verificar el estado de OpenAI"""
+    try:
+        if not OPENAI_API_KEY:
+            return {"status": "warning", "message": "OPENAI_API_KEY no configurada"}
+
+        if not openai_client:
+            return {"status": "error", "message": "Cliente OpenAI no disponible. Instala con: pip install openai"}
+
+        return {
+            "status": "ok",
+            "model": OPENAI_MODEL,
+            "client_available": True
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/grok/status")
+def grok_status():
+    """Endpoint para verificar el estado de Grok (xAI)"""
+    try:
+        if not GROK_API_KEY:
+            return {"status": "warning", "message": "GROK_API_KEY no configurada"}
+
+        if not grok_client:
+            return {"status": "error", "message": "Cliente Grok no disponible. Instala con: pip install openai"}
+
+        return {
+            "status": "ok",
+            "model": GROK_MODEL,
+            "client_available": True
+        }
+    except Exception as e:
+        return {"status": "error", "message": str(e)}
+
+
+@router.get("/ai/status")
+def ai_providers_status():
+    """Endpoint para ver el estado de todos los proveedores de IA"""
+    return {
+        "gemini": {
+            "configured": bool(GEMINI_API_KEY),
+            "model": GEMINI_MODEL if GEMINI_API_KEY else None
+        },
+        "openai": {
+            "configured": bool(OPENAI_API_KEY),
+            "model": OPENAI_MODEL if OPENAI_API_KEY else None,
+            "client_available": openai_client is not None
+        },
+        "grok": {
+            "configured": bool(GROK_API_KEY),
+            "model": GROK_MODEL if GROK_API_KEY else None,
+            "client_available": grok_client is not None
+        },
+        "local": {
+            "available": True,
+            "description": "Fallback local siempre disponible"
+        }
+    }

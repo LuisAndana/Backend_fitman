@@ -1,70 +1,39 @@
-# routers/rutinas.py - VERSIÓN ULTRA FLEXIBLE PARA DIAGNOSTICAR
+# routers/rutinas.py - VERSIÓN CORREGIDA PARA GUARDAR CORRECTAMENTE
 
 from fastapi import APIRouter, HTTPException, status, Body
+from typing import Dict, Any, List, Optional
 from pydantic import BaseModel
-from typing import Optional, List, Dict, Any
 from datetime import datetime
 import json
 from db import get_connection
 
 
 # ============================================================
-# 📋 MODELOS PYDANTIC
+# 🔹 MODELOS PYDANTIC
 # ============================================================
 
 class EjercicioRutina(BaseModel):
-    """Estructura de un ejercicio dentro de la rutina"""
-    id_ejercicio: Optional[int] = None
+    """Modelo de ejercicio dentro de una rutina"""
     nombre: str
-    descripcion: Optional[str] = None
-    grupo_muscular: str
-    dificultad: str
-    tipo: str
-    series: Optional[int] = None
-    repeticiones: Optional[int] = None
-    descanso_segundos: Optional[int] = None
+    series: int
+    repeticiones: str
+    descanso: str
     notas: Optional[str] = None
-
-    class Config:
-        extra = "allow"  # Permite campos adicionales
 
 
 class DiaRutina(BaseModel):
-    """Estructura de un día dentro de la rutina"""
-    numero_dia: int
-    nombre_dia: str
-    descripcion: Optional[str] = None
-    grupos_enfoque: List[str] = []
-    ejercicios: List[EjercicioRutina] = []
-
-    class Config:
-        extra = "allow"
+    """Modelo de día dentro de una rutina"""
+    dia: str
+    musculo: str
+    ejercicios: List[EjercicioRutina]
 
 
 class RutinaCreate(BaseModel):
-    """Modelo para crear una rutina completa"""
+    """Modelo de entrada para crear rutina"""
     nombre: str
     descripcion: str
-    creado_por: int
-    objetivo: Optional[str] = None
-    grupo_muscular: Optional[str] = "general"
-    nivel: Optional[str] = "intermedio"
-    dias_semana: Optional[int] = 4
-    total_ejercicios: Optional[int] = 0
-    minutos_aproximados: Optional[int] = 0
-    fecha_creacion: Optional[str] = None
-    generada_por: Optional[str] = "IA"
-    dias: Optional[List[DiaRutina]] = []
-    ejercicios: Optional[List[EjercicioRutina]] = []
-
-    class Config:
-        extra = "allow"  # Permite campos adicionales
-
-
-class RutinaUpdate(BaseModel):
-    """Modelo para actualizar una rutina"""
-    nombre: Optional[str] = None
-    descripcion: Optional[str] = None
+    creado_por: Optional[int] = None
+    id_cliente: Optional[int] = None  # Para compatibilidad con IA
     objetivo: Optional[str] = None
     grupo_muscular: Optional[str] = None
     nivel: Optional[str] = None
@@ -96,27 +65,6 @@ class RutinaOut(BaseModel):
         extra = "allow"
 
 
-class UsuarioCreate(BaseModel):
-    email: str
-    nombre: str
-    apellido: str
-    rol: str
-
-
-class UsuarioOut(BaseModel):
-    id_usuario: int
-    email: str
-    nombre: str
-    apellido: str
-    rol: str
-
-
-class EntrenadorOut(BaseModel):
-    id_usuario: int
-    nombre: str
-    email: str
-
-
 # ============================================================
 # 🔹 ROUTER PRINCIPAL
 # ============================================================
@@ -125,94 +73,116 @@ router = APIRouter()
 
 
 # ============================================================
-# 🔹 ENDPOINT DE DIAGNÓSTICO - ACEPTA CUALQUIER COSA
+# 🔹 ENDPOINT DE CREACIÓN - VERSIÓN CORREGIDA
 # ============================================================
 
 @router.post("/", status_code=status.HTTP_201_CREATED, response_model=Dict[str, Any])
 def crear_rutina(payload: Dict[str, Any] = Body(...)):
     """
-    ✅ Crear una rutina - VERSIÓN DIAGNÓSTICO
-    Acepta CUALQUIER estructura JSON
+    ✅ Crear una rutina - VERSIÓN CORREGIDA
+    Acepta tanto la estructura manual como la de IA
     """
     cn = None
+    cur = None
     try:
         print("\n" + "=" * 100)
-        print("🔍 DEBUG COMPLETO: POST /api/rutinas/")
+        print("🔍 POST /api/rutinas/ - Guardando rutina")
         print("=" * 100)
 
-        print(f"\n📥 DATOS RECIBIDOS (RAW):")
-        print(f"Type: {type(payload)}")
-        print(f"Content: {json.dumps(payload, indent=2, default=str)}")
+        print(f"\n📥 DATOS RECIBIDOS:")
+        print(f"Keys: {list(payload.keys())}")
 
-        # Extraer datos con defaults
-        nombre = payload.get('nombre')
-        descripcion = payload.get('descripcion')
-        creado_por = payload.get('creado_por')
-        objetivo = payload.get('objetivo', '')
-        grupo_muscular = payload.get('grupo_muscular', 'general')
-        nivel = payload.get('nivel', 'intermedio')
+        # ========================================
+        # NORMALIZACIÓN DE CAMPOS
+        # ========================================
+
+        # El endpoint de IA envía "id_cliente", pero la BD espera "creado_por"
+        creado_por = payload.get('creado_por') or payload.get('id_cliente')
+
+        # Campos básicos
+        nombre = payload.get('nombre', '').strip()
+        descripcion = payload.get('descripcion', '').strip()
+        objetivo = payload.get('objetivo', '').strip()
+        grupo_muscular = payload.get('grupo_muscular', 'general').strip()
+        nivel = payload.get('nivel', 'intermedio').strip()
         dias_semana = payload.get('dias_semana', 4)
         total_ejercicios = payload.get('total_ejercicios', 0)
         minutos_aproximados = payload.get('minutos_aproximados', 0)
         fecha_creacion = payload.get('fecha_creacion')
-        generada_por = payload.get('generada_por', 'IA')
+        generada_por = payload.get('generada_por', 'IA').strip()
         dias = payload.get('dias', [])
-        ejercicios = payload.get('ejercicios', [])
 
-        print(f"\n📋 DATOS PARSEADOS:")
-        print(f"   nombre: {nombre} (type: {type(nombre)})")
-        print(f"   descripcion: {descripcion} (type: {type(descripcion)})")
-        print(f"   creado_por: {creado_por} (type: {type(creado_por)})")
-        print(f"   objetivo: {objetivo}")
-        print(f"   grupo_muscular: {grupo_muscular}")
-        print(f"   nivel: {nivel}")
-        print(f"   dias_semana: {dias_semana} (type: {type(dias_semana)})")
-        print(f"   total_ejercicios: {total_ejercicios} (type: {type(total_ejercicios)})")
-        print(f"   minutos_aproximados: {minutos_aproximados} (type: {type(minutos_aproximados)})")
-        print(f"   fecha_creacion: {fecha_creacion}")
-        print(f"   generada_por: {generada_por}")
-        print(f"   dias (count): {len(dias) if isinstance(dias, list) else 'NOT A LIST'}")
-        print(f"   ejercicios (count): {len(ejercicios) if isinstance(ejercicios, list) else 'NOT A LIST'}")
+        print(f"\n📋 DATOS NORMALIZADOS:")
+        print(f"   nombre: {nombre}")
+        print(f"   descripcion: {descripcion}")
+        print(f"   creado_por: {creado_por} (de id_cliente o creado_por)")
+        print(f"   dias_semana: {dias_semana}")
+        print(f"   dias (count): {len(dias) if isinstance(dias, list) else 0}")
 
-        # Validaciones
-        print(f"\n✅ VALIDANDO...")
-        if not nombre or len(str(nombre).strip()) == 0:
+        # ========================================
+        # VALIDACIONES
+        # ========================================
+
+        if not nombre:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="nombre es obligatorio y no puede estar vacío"
+                detail="El campo 'nombre' es obligatorio y no puede estar vacío"
             )
-        print(f"   ✓ nombre OK")
 
-        if not descripcion or len(str(descripcion).strip()) == 0:
+        if not descripcion:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="descripcion es obligatoria y no puede estar vacía"
+                detail="El campo 'descripcion' es obligatorio y no puede estar vacío"
             )
-        print(f"   ✓ descripcion OK")
 
-        if not creado_por or int(creado_por) <= 0:
+        if not creado_por:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
-                detail="creado_por es obligatorio y debe ser > 0"
+                detail="El campo 'creado_por' o 'id_cliente' es obligatorio"
             )
-        print(f"   ✓ creado_por OK")
 
-        # Preparar datos
-        fecha_creacion = fecha_creacion or datetime.now().isoformat()
+        try:
+            creado_por = int(creado_por)
+            if creado_por <= 0:
+                raise ValueError("El ID debe ser mayor a 0")
+        except (ValueError, TypeError) as e:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"El campo 'creado_por' debe ser un número entero positivo: {str(e)}"
+            )
 
-        # Convertir días a JSON
-        dias_json = json.dumps(dias) if dias else "[]"
+        print(f"   ✅ Validaciones pasadas")
 
-        print(f"   ✓ Datos preparados")
+        # ========================================
+        # PREPARAR DATOS PARA BD
+        # ========================================
 
-        # Conectar a BD
+        # Convertir días a JSON si existen
+        if dias and isinstance(dias, list):
+            # Asegurarse de que sea serializable
+            dias_json = json.dumps(dias, ensure_ascii=False)
+        else:
+            dias_json = "[]"
+
+        # Fecha de creación
+        if not fecha_creacion:
+            fecha_creacion = datetime.now().isoformat()
+
+        print(f"\n📦 DATOS PREPARADOS PARA BD:")
+        print(f"   nombre: {nombre}")
+        print(f"   descripcion: {descripcion[:50]}...")
+        print(f"   creado_por: {creado_por}")
+        print(f"   dias_json length: {len(dias_json)} chars")
+
+        # ========================================
+        # INSERTAR EN BD
+        # ========================================
+
         print(f"\n🔗 CONECTANDO A BD...")
         cn = get_connection()
         cur = cn.cursor()
-        print(f"✅ Conectado a BD")
+        print(f"✅ Conectado")
 
-        # Insertar rutina
-        print(f"\n💾 EJECUTANDO INSERT...")
         sql = """
             INSERT INTO rutinas (
                 nombre, descripcion, creado_por, objetivo,
@@ -222,97 +192,124 @@ def crear_rutina(payload: Dict[str, Any] = Body(...)):
             )
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """
+
         values = (
-            str(nombre),
-            str(descripcion),
-            int(creado_por),
-            str(objetivo) or '',
-            str(grupo_muscular) or 'general',
-            str(nivel) or 'intermedio',
-            int(dias_semana) or 4,
-            int(total_ejercicios) or 0,
-            int(minutos_aproximados) or 0,
+            nombre,
+            descripcion,
+            creado_por,
+            objetivo if objetivo else '',
+            grupo_muscular,
+            nivel,
+            int(dias_semana) if dias_semana else 4,
+            int(total_ejercicios) if total_ejercicios else 0,
+            int(minutos_aproximados) if minutos_aproximados else 0,
             fecha_creacion,
-            str(generada_por) or 'IA',
+            generada_por,
             dias_json
         )
 
+        print(f"\n💾 EJECUTANDO INSERT...")
         print(f"SQL: {sql}")
-        print(f"VALUES: {values}")
+        print(f"VALUES: {values[:3]}... (mostrando primeros 3)")
 
         cur.execute(sql, values)
-        print("✅ INSERT ejecutado")
+        print(f"✅ INSERT ejecutado")
 
         cn.commit()
-        print("✅ Cambios confirmados")
+        print(f"✅ COMMIT realizado")
 
         new_id = cur.lastrowid
         print(f"✅ Rutina creada con ID: {new_id}")
 
-        print("\n" + "=" * 100)
-        print("✅ ¡ÉXITO! Rutina guardada correctamente")
-        print("=" * 100 + "\n")
+        # ========================================
+        # PREPARAR RESPUESTA
+        # ========================================
 
-        return {
+        rutina_guardada = {
             "id_rutina": new_id,
-            "mensaje": "✅ Rutina creada exitosamente",
-            "debug": {
-                "datos_recibidos": payload,
-                "tipos": {
-                    "nombre": str(type(nombre)),
-                    "descripcion": str(type(descripcion)),
-                    "creado_por": str(type(creado_por)),
-                }
-            }
+            "nombre": nombre,
+            "descripcion": descripcion,
+            "creado_por": creado_por,
+            "objetivo": objetivo,
+            "grupo_muscular": grupo_muscular,
+            "nivel": nivel,
+            "dias_semana": int(dias_semana) if dias_semana else 4,
+            "total_ejercicios": int(total_ejercicios) if total_ejercicios else 0,
+            "minutos_aproximados": int(minutos_aproximados) if minutos_aproximados else 0,
+            "fecha_creacion": fecha_creacion,
+            "generada_por": generada_por,
+            "dias": dias if dias else []
         }
 
-    except HTTPException as he:
-        print(f"\n❌ HTTPException: {he.detail}")
-        print("=" * 100 + "\n")
-        raise he
+        print(f"\n" + "=" * 100)
+        print(f"✅ ¡RUTINA GUARDADA EXITOSAMENTE!")
+        print(f"   ID: {new_id}")
+        print(f"   Nombre: {nombre}")
+        print(f"=" * 100 + "\n")
+
+        return {
+            "mensaje": "✅ Rutina creada exitosamente",
+            "id_rutina": new_id,
+            "rutina": rutina_guardada
+        }
+
+    except HTTPException:
+        # Re-lanzar excepciones HTTP
+        raise
+
     except Exception as e:
-        print(f"\n❌ Error: {str(e)}")
+        print(f"\n❌ ERROR INESPERADO:")
         print(f"   Tipo: {type(e).__name__}")
+        print(f"   Mensaje: {str(e)}")
+
         import traceback
-        print(f"   Traceback: {traceback.format_exc()}")
-        print("=" * 100 + "\n")
+        print(f"\n📋 TRACEBACK COMPLETO:")
+        print(traceback.format_exc())
+
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Error al crear rutina: {str(e)}"
         )
+
     finally:
-        if cn and cn.is_connected():
-            try:
-                cur.close()
-                cn.close()
-            except:
-                pass
+        # Cerrar conexiones
+        if cur:
+            cur.close()
+            print(f"🔒 Cursor cerrado")
+        if cn:
+            cn.close()
+            print(f"🔒 Conexión cerrada")
 
 
-@router.get("/", response_model=List[RutinaOut])
+# ============================================================
+# 🔹 OBTENER TODAS LAS RUTINAS
+# ============================================================
+
+@router.get("/", response_model=List[Dict[str, Any]])
 def listar_rutinas():
-    """✅ Listar todas las rutinas"""
+    """
+    Listar todas las rutinas
+    """
     cn = None
+    cur = None
     try:
-        print("🔍 DEBUG: GET /api/rutinas/")
         cn = get_connection()
         cur = cn.cursor(dictionary=True)
 
-        cur.execute("""
+        sql = """
             SELECT 
-                r.id_rutina, r.nombre, r.descripcion, r.creado_por,
-                r.objetivo, r.grupo_muscular, r.nivel, r.dias_semana,
-                r.total_ejercicios, r.minutos_aproximados,
-                r.fecha_creacion, r.generada_por, r.contenido_dias
-            FROM rutinas r
-            ORDER BY r.fecha_creacion DESC
-        """)
+                id_rutina, nombre, descripcion, creado_por,
+                objetivo, grupo_muscular, nivel, dias_semana,
+                total_ejercicios, minutos_aproximados,
+                fecha_creacion, generada_por, contenido_dias
+            FROM rutinas
+            ORDER BY fecha_creacion DESC
+        """
 
+        cur.execute(sql)
         rutinas = cur.fetchall()
 
-        print(f"✅ Se obtuvieron {len(rutinas)} rutinas")
-
-        # Convertir JSON string de vuelta a objeto
+        # Parsear el JSON de contenido_dias
         for rutina in rutinas:
             if rutina.get('contenido_dias'):
                 try:
@@ -321,47 +318,61 @@ def listar_rutinas():
                     rutina['dias'] = []
             else:
                 rutina['dias'] = []
-            if 'contenido_dias' in rutina:
-                del rutina['contenido_dias']
+
+            # Convertir fecha a string si es necesario
+            if rutina.get('fecha_creacion'):
+                if isinstance(rutina['fecha_creacion'], datetime):
+                    rutina['fecha_creacion'] = rutina['fecha_creacion'].isoformat()
 
         return rutinas
 
     except Exception as e:
-        print(f"❌ Error al listar rutinas: {str(e)}")
-        raise HTTPException(status_code=500, detail="Error al listar rutinas")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al listar rutinas: {str(e)}"
+        )
     finally:
-        if cn and cn.is_connected():
-            try:
-                cur.close()
-                cn.close()
-            except:
-                pass
+        if cur:
+            cur.close()
+        if cn:
+            cn.close()
 
 
-@router.get("/{id_rutina}", response_model=RutinaOut)
+# ============================================================
+# 🔹 OBTENER RUTINA POR ID
+# ============================================================
+
+@router.get("/{id_rutina}", response_model=Dict[str, Any])
 def obtener_rutina(id_rutina: int):
-    """✅ Obtener rutina específica"""
+    """
+    Obtener una rutina específica por ID
+    """
     cn = None
+    cur = None
     try:
-        print(f"🔍 DEBUG: GET /api/rutinas/{id_rutina}")
         cn = get_connection()
         cur = cn.cursor(dictionary=True)
 
-        cur.execute("""
+        sql = """
             SELECT 
                 id_rutina, nombre, descripcion, creado_por,
                 objetivo, grupo_muscular, nivel, dias_semana,
                 total_ejercicios, minutos_aproximados,
                 fecha_creacion, generada_por, contenido_dias
-            FROM rutinas WHERE id_rutina = %s
-        """, (id_rutina,))
+            FROM rutinas
+            WHERE id_rutina = %s
+        """
 
+        cur.execute(sql, (id_rutina,))
         rutina = cur.fetchone()
 
         if not rutina:
-            raise HTTPException(status_code=404, detail="Rutina no encontrada")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Rutina con ID {id_rutina} no encontrada"
+            )
 
-        # Convertir JSON
+        # Parsear el JSON de contenido_dias
         if rutina.get('contenido_dias'):
             try:
                 rutina['dias'] = json.loads(rutina['contenido_dias'])
@@ -369,146 +380,215 @@ def obtener_rutina(id_rutina: int):
                 rutina['dias'] = []
         else:
             rutina['dias'] = []
-        del rutina['contenido_dias']
+
+        # Convertir fecha a string si es necesario
+        if rutina.get('fecha_creacion'):
+            if isinstance(rutina['fecha_creacion'], datetime):
+                rutina['fecha_creacion'] = rutina['fecha_creacion'].isoformat()
 
         return rutina
 
-    except HTTPException as he:
-        raise he
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Error al obtener rutina")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al obtener rutina: {str(e)}"
+        )
     finally:
-        if cn and cn.is_connected():
-            try:
-                cur.close()
-                cn.close()
-            except:
-                pass
+        if cur:
+            cur.close()
+        if cn:
+            cn.close()
 
+
+# ============================================================
+# 🔹 ACTUALIZAR RUTINA
+# ============================================================
 
 @router.put("/{id_rutina}", response_model=Dict[str, Any])
 def actualizar_rutina(id_rutina: int, payload: Dict[str, Any] = Body(...)):
-    """✅ Actualizar rutina"""
+    """
+    Actualizar una rutina existente
+    """
     cn = None
+    cur = None
     try:
         cn = get_connection()
         cur = cn.cursor()
 
+        # Verificar que la rutina existe
+        cur.execute("SELECT id_rutina FROM rutinas WHERE id_rutina = %s", (id_rutina,))
+        if not cur.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Rutina con ID {id_rutina} no encontrada"
+            )
+
+        # Preparar campos a actualizar
         campos = []
         valores = []
 
-        for key, value in payload.items():
-            if value is not None and key not in ['id_rutina', 'fecha_creacion']:
-                if key == 'dias':
-                    campos.append("contenido_dias = %s")
-                    valores.append(json.dumps(value))
-                else:
-                    campos.append(f"{key} = %s")
-                    valores.append(value)
+        if 'nombre' in payload:
+            campos.append("nombre = %s")
+            valores.append(payload['nombre'])
+
+        if 'descripcion' in payload:
+            campos.append("descripcion = %s")
+            valores.append(payload['descripcion'])
+
+        if 'objetivo' in payload:
+            campos.append("objetivo = %s")
+            valores.append(payload['objetivo'])
+
+        if 'grupo_muscular' in payload:
+            campos.append("grupo_muscular = %s")
+            valores.append(payload['grupo_muscular'])
+
+        if 'nivel' in payload:
+            campos.append("nivel = %s")
+            valores.append(payload['nivel'])
+
+        if 'dias_semana' in payload:
+            campos.append("dias_semana = %s")
+            valores.append(payload['dias_semana'])
+
+        if 'dias' in payload:
+            campos.append("contenido_dias = %s")
+            valores.append(json.dumps(payload['dias'], ensure_ascii=False))
 
         if not campos:
-            raise HTTPException(status_code=400, detail="No hay campos para actualizar")
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No hay campos para actualizar"
+            )
 
+        # Agregar ID al final
         valores.append(id_rutina)
-        sql = f"UPDATE rutinas SET {', '.join(campos)} WHERE id_rutina = %s"
 
+        sql = f"UPDATE rutinas SET {', '.join(campos)} WHERE id_rutina = %s"
         cur.execute(sql, valores)
         cn.commit()
 
-        return {"id_rutina": id_rutina, "mensaje": "✅ Rutina actualizada"}
+        return {
+            "mensaje": "✅ Rutina actualizada exitosamente",
+            "id_rutina": id_rutina
+        }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+        if cn:
+            cn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al actualizar rutina: {str(e)}"
+        )
     finally:
-        if cn and cn.is_connected():
-            try:
-                cur.close()
-                cn.close()
-            except:
-                pass
+        if cur:
+            cur.close()
+        if cn:
+            cn.close()
 
+
+# ============================================================
+# 🔹 ELIMINAR RUTINA
+# ============================================================
 
 @router.delete("/{id_rutina}", status_code=status.HTTP_204_NO_CONTENT)
 def eliminar_rutina(id_rutina: int):
-    """✅ Eliminar rutina"""
+    """
+    Eliminar una rutina
+    """
     cn = None
+    cur = None
     try:
         cn = get_connection()
         cur = cn.cursor()
 
+        # Verificar que la rutina existe
+        cur.execute("SELECT id_rutina FROM rutinas WHERE id_rutina = %s", (id_rutina,))
+        if not cur.fetchone():
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Rutina con ID {id_rutina} no encontrada"
+            )
+
+        # Eliminar la rutina
         cur.execute("DELETE FROM rutinas WHERE id_rutina = %s", (id_rutina,))
         cn.commit()
 
-        if cur.rowcount == 0:
-            raise HTTPException(status_code=404, detail="Rutina no encontrada")
-
         return None
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail="Error al eliminar rutina")
+        if cn:
+            cn.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al eliminar rutina: {str(e)}"
+        )
     finally:
-        if cn and cn.is_connected():
-            try:
-                cur.close()
-                cn.close()
-            except:
-                pass
+        if cur:
+            cur.close()
+        if cn:
+            cn.close()
 
 
 # ============================================================
-# 🔹 ENDPOINTS STUBS
+# 🔹 OBTENER RUTINAS POR ALUMNO
 # ============================================================
 
-@router.get("/usuarios/", response_model=List[UsuarioOut], tags=["Usuarios"])
-def listar_usuarios():
-    return []
+@router.get("/alumno/{id_alumno}", response_model=List[Dict[str, Any]])
+def obtener_rutinas_alumno(id_alumno: int):
+    """
+    Obtener todas las rutinas de un alumno específico
+    """
+    cn = None
+    cur = None
+    try:
+        cn = get_connection()
+        cur = cn.cursor(dictionary=True)
 
+        sql = """
+            SELECT 
+                id_rutina, nombre, descripcion, creado_por,
+                objetivo, grupo_muscular, nivel, dias_semana,
+                total_ejercicios, minutos_aproximados,
+                fecha_creacion, generada_por, contenido_dias
+            FROM rutinas
+            WHERE creado_por = %s
+            ORDER BY fecha_creacion DESC
+        """
 
-@router.get("/usuarios/{id_usuario}", response_model=UsuarioOut, tags=["Usuarios"])
-def obtener_usuario(id_usuario: int):
-    raise HTTPException(status_code=404, detail="Usuario no encontrado")
+        cur.execute(sql, (id_alumno,))
+        rutinas = cur.fetchall()
 
+        # Parsear el JSON de contenido_dias
+        for rutina in rutinas:
+            if rutina.get('contenido_dias'):
+                try:
+                    rutina['dias'] = json.loads(rutina['contenido_dias'])
+                except:
+                    rutina['dias'] = []
+            else:
+                rutina['dias'] = []
 
-@router.post("/usuarios/", status_code=status.HTTP_201_CREATED, tags=["Usuarios"])
-def crear_usuario(payload: UsuarioCreate):
-    return {"id": 1, "mensaje": "Usuario creado"}
+            # Convertir fecha a string si es necesario
+            if rutina.get('fecha_creacion'):
+                if isinstance(rutina['fecha_creacion'], datetime):
+                    rutina['fecha_creacion'] = rutina['fecha_creacion'].isoformat()
 
+        return rutinas
 
-@router.get("/entrenadores/", response_model=List[EntrenadorOut], tags=["Entrenadores"])
-def listar_entrenadores():
-    return []
-
-
-@router.get("/entrenadores/{id_entrenador}", response_model=EntrenadorOut, tags=["Entrenadores"])
-def obtener_entrenador(id_entrenador: int):
-    raise HTTPException(status_code=404, detail="Entrenador no encontrado")
-
-
-@router.get("/ejercicios/", tags=["Ejercicios"])
-def listar_ejercicios():
-    return []
-
-
-@router.get("/asignaciones/", tags=["Asignaciones"])
-def listar_asignaciones():
-    return []
-
-
-@router.get("/resenas/", tags=["Reseñas"])
-def listar_resenas():
-    return []
-
-
-@router.get("/mensajes/", tags=["Mensajes"])
-def listar_mensajes():
-    return []
-
-
-@router.get("/pagos/", tags=["Pagos"])
-def listar_pagos():
-    return []
-
-
-@router.get("/ia/status", tags=["IA"])
-def ia_status():
-    return {"status": "ok"}
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Error al obtener rutinas del alumno: {str(e)}"
+        )
+    finally:
+        if cur:
+            cur.close()
+        if cn:
+            cn.close()

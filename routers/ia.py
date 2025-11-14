@@ -1,7 +1,7 @@
-# routers/ia_router.py - Router IA V4 (Gemini + OpenAI + fallback local + filtros de salud)
+# routers/ia_router.py - Router IA V5 (Gemini + OpenAI + Grok + Vigencia de Rutinas)
 
-from fastapi import APIRouter, HTTPException, Depends
-from pydantic import BaseModel
+from fastapi import APIRouter, HTTPException, Depends, Query
+from pydantic import BaseModel, Field, field_validator
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from typing import List, Optional, Dict, Any, Literal
@@ -9,7 +9,7 @@ import google.generativeai as genai
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from utils.dependencies import get_db
 
@@ -74,6 +74,9 @@ else:
 # ============================================================
 
 from enum import Enum
+
+class ExtenderVigenciaRequest(BaseModel):
+    meses_adicionales: int
 
 
 class SexoEnum(str, Enum):
@@ -164,6 +167,10 @@ class RutinaCompleta(BaseModel):
     dias_semana: int
     total_ejercicios: int
     minutos_aproximados: int
+    duracion_meses: int  # NUEVO: Duración en meses
+    fecha_inicio_vigencia: Optional[str] = None  # NUEVO: Fecha inicio
+    fecha_fin_vigencia: Optional[str] = None  # NUEVO: Fecha fin
+    estado_vigencia: str = "pendiente"  # NUEVO: Estado
     dias: List[DiaRutinaDetallado]
     fecha_creacion: str
     generada_por: str
@@ -179,11 +186,23 @@ class SeguridadOut(BaseModel):
 class SolicitudGenerarRutina(BaseModel):
     id_cliente: int
     objetivos: str
-    dias: int  # 2-7
+    dias: int = Field(..., ge=2, le=7, description="Días de entrenamiento por semana (2-7)")
     nivel: str  # "principiante" | "intermedio" | "avanzado"
     grupo_muscular_foco: Optional[str] = "general"
     perfil_salud: Optional[PerfilSalud] = None
-    proveedor: Literal["auto", "gemini", "openai", "grok", "local"] = "auto"  # <-- ACTUALIZADO CON GROK
+    proveedor: Literal["auto", "gemini", "openai", "grok", "local"] = "auto"
+    duracion_meses: int = Field(
+        default=1,
+        ge=1,
+        le=12,
+        description="Duración de la rutina en meses (1-12)"
+    )  # NUEVO
+
+    @field_validator('duracion_meses')
+    def validar_duracion(cls, v):
+        if v < 1 or v > 12:
+            raise ValueError('La duración debe estar entre 1 y 12 meses')
+        return v
 
 
 # ============================================================
@@ -258,6 +277,82 @@ FALLBACK_LIGHT_MODEL = os.getenv("GEMINI_FALLBACK_MODEL", "models/gemini-2.5-fla
 
 
 # ============================================================
+# FUNCIONES DE VIGENCIA - NUEVO
+# ============================================================
+
+def calcular_fechas_vigencia(duracion_meses: int, fecha_inicio: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    Calcula las fechas de inicio y fin de vigencia de una rutina.
+
+    Args:
+        duracion_meses: Duración en meses (1-12)
+        fecha_inicio: Fecha de inicio (None = hoy)
+
+    Returns:
+        Dict con fecha_inicio, fecha_fin y dias_totales
+    """
+    if fecha_inicio is None:
+        fecha_inicio = datetime.now()
+
+    # Calcular fecha de fin sumando meses
+    mes_fin = fecha_inicio.month + duracion_meses
+    anio_fin = fecha_inicio.year
+
+    while mes_fin > 12:
+        mes_fin -= 12
+        anio_fin += 1
+
+    # Ajustar día si el mes de destino tiene menos días
+    dias_en_mes = [31, 29 if anio_fin % 4 == 0 else 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    dia_fin = min(fecha_inicio.day, dias_en_mes[mes_fin - 1])
+
+    fecha_fin = datetime(anio_fin, mes_fin, dia_fin,
+                         fecha_inicio.hour, fecha_inicio.minute, fecha_inicio.second)
+
+    dias_totales = (fecha_fin - fecha_inicio).days
+
+    return {
+        "fecha_inicio": fecha_inicio,
+        "fecha_fin": fecha_fin,
+        "dias_totales": dias_totales,
+        "duracion_meses": duracion_meses
+    }
+
+
+def obtener_estado_vigencia(fecha_fin: datetime, fecha_inicio: Optional[datetime] = None) -> Dict[str, Any]:
+    """
+    Determina el estado de vigencia de una rutina.
+
+    Returns:
+        Dict con estado, dias_restantes y porcentaje_completado
+    """
+    ahora = datetime.now()
+    dias_restantes = (fecha_fin - ahora).days
+
+    # Determinar estado
+    if dias_restantes < 0:
+        estado = "vencida"
+    elif dias_restantes <= 7:
+        estado = "por_vencer"
+    else:
+        estado = "activa"
+
+    # Calcular porcentaje completado
+    porcentaje_completado = 0.0
+    if fecha_inicio:
+        dias_totales = (fecha_fin - fecha_inicio).days
+        if dias_totales > 0:
+            dias_transcurridos = (ahora - fecha_inicio).days
+            porcentaje_completado = min(100.0, max(0.0, (dias_transcurridos / dias_totales) * 100))
+
+    return {
+        "estado": estado,
+        "dias_restantes": max(0, dias_restantes),
+        "porcentaje_completado": round(porcentaje_completado, 2)
+    }
+
+
+# ============================================================
 # HELPER FUNCTIONS - DETECCIÓN DE ERRORES
 # ============================================================
 
@@ -282,7 +377,6 @@ def _supports_generate_content(m) -> bool:
 
 
 def _normalize_model_name(name: str) -> str:
-    # El SDK lista modelos como "models/gemini-1.5-pro-002". Aceptamos ambos.
     return name.split("/")[-1] if name and "/" in name else name
 
 
@@ -294,24 +388,20 @@ def _select_gemini_model() -> str:
     try:
         models = list(genai.list_models())
     except Exception as e:
-        # Si no podemos listar, usa el que pidieron o el preferido por defecto
         return wanted or PREFERRED_MODELS[0]
 
-    # Si pidieron uno concreto, valídalo contra la lista
     if wanted:
         for m in models:
             m_id = _normalize_model_name(getattr(m, "name", ""))
             if m_id == _normalize_model_name(wanted) and _supports_generate_content(m):
                 return m_id
 
-    # Si no hay/valido, usa el primero de los preferidos que esté disponible
     for pref in PREFERRED_MODELS:
         for m in models:
             m_id = _normalize_model_name(getattr(m, "name", ""))
             if m_id == pref and _supports_generate_content(m):
                 return pref
 
-    # Último recurso: el primer modelo que soporte generateContent
     for m in models:
         if _supports_generate_content(m):
             return _normalize_model_name(getattr(m, "name", ""))
@@ -389,7 +479,6 @@ def _score_prioridad_gluteo(ej: Dict[str, Any]) -> int:
     s = 0
     for kw in PRIORIDAD_GLUTEOS:
         if kw in t: s += 2
-    # bonus si grupo = PIERNAS/GLÚTEO
     if "glúteo" in t or (ej.get("grupo_muscular", "").upper() in ["PIERNAS", "GLÚTEOS"]):
         s += 1
     return s
@@ -411,7 +500,6 @@ def _split_por_objetivo(dias: int, objetivos: str, foco: Optional[str]) -> List[
     if not es_gluteo:
         return PLANES_DISTRIBUCION.get(dias, PLANES_DISTRIBUCION[4])
 
-    # Splits con 2–3 días de glúteos por semana
     presets = {
         3: [["GLÚTEOS/PIERNAS"], ["UPPER LIGERO"], ["GLÚTEOS/PIERNAS"]],
         4: [["GLÚTEOS/QUADS"], ["UPPER LIGERO"], ["GLÚTEOS/ISQUIOS"], ["CORE/CARDIO SUAVE"]],
@@ -422,7 +510,6 @@ def _split_por_objetivo(dias: int, objetivos: str, foco: Optional[str]) -> List[
             ["UPPER LIGERO"], ["DESCANSO"]],
     }
 
-    # Fallback cercano si no hay preset exacto
     if dias in presets:
         return presets[dias]
     if dias < 3:
@@ -482,20 +569,18 @@ def distribuir_ejercicios_inteligente(
     dias: List[DiaRutinaDetallado] = []
     nombres = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
 
-    # Split por objetivo (glúteos) o genérico
     plan = _split_por_objetivo(dias_semana, objetivo, None)
 
     idxs = {g: 0 for g in ejercicios_por_grupo.keys()}
     advertencias: List[str] = []
     casa_sin_equipo = _es_casa_sin_equipo(perfil.preferencias if perfil else None)
 
-    # Función local para "expandir" etiquetas artificiales a grupos reales
     def expandir_grupo(alias: str) -> List[str]:
         a = alias.upper()
         if "UPPER" in a:
             return ["PECHO", "ESPALDA", "HOMBROS", "BRAZOS"]
         if "GLÚTEOS" in a or "GLUTEOS" in a or "GLUTE" in a:
-            return ["PIERNAS"]  # usamos pool de PIERNAS pero luego priorizamos por score de glúteo
+            return ["PIERNAS"]
         if "CORE" in a:
             return ["CORE"]
         if "CARDIO" in a:
@@ -506,19 +591,17 @@ def distribuir_ejercicios_inteligente(
 
     for i, grupos in enumerate(plan):
         nombre_dia = nombres[i] if i < len(nombres) else f"Día {i + 1}"
-        # Expande aliases (UPPER LIGERO, GLÚTEOS/QUADS, etc.)
         grupos_norm: List[str] = []
         for g in grupos:
-            # Soporte de alias escritos como "GLÚTEOS/ISQUIOS"
             partes = [p.strip() for p in g.replace("/", ",").split(",")]
             for p in partes:
                 grupos_norm.extend(expandir_grupo(p))
 
         activos = [g for g in grupos_norm if g != "DESCANSO"]
-        n_por_grupo = max(2, 6 // max(1, len(activos)))  # ~5–6 ejercicios/día
+        n_por_grupo = max(2, 6 // max(1, len(activos)))
 
         ej_del_dia: List[EjercicioRutina] = []
-        usados: set = set()  # (id, nombre) para evitar duplicados
+        usados: set = set()
 
         for g in grupos_norm:
             if g == "DESCANSO":
@@ -527,20 +610,16 @@ def distribuir_ejercicios_inteligente(
             g_pri = MAPEO_GRUPOS_SECUNDARIOS.get(g, g)
             pool = list(ejercicios_por_grupo.get(g_pri, []))
 
-            # 1) Filtra por salud
             pool, seg_local = validar_filtrar_ejercicios(perfil, pool)
             if seg_local.advertencias:
                 advertencias.extend([f"{nombre_dia}/{g}: {a}" for a in seg_local.advertencias])
 
-            # 2) Filtra por equipo si casa sin equipo
             if casa_sin_equipo:
                 pool = [e for e in pool if not _descarta_por_equipo_si_casa_sin_equipo(e)]
 
-            # 3) Prioriza glúteos por score si el objetivo es glúteos
             if _objetivo_es_gluteos(objetivo, "gluteo"):
                 pool.sort(key=_score_prioridad_gluteo, reverse=True)
 
-            # 4) Selección circular con deduplicación
             obtenidos = 0
             intentos = 0
             while obtenidos < n_por_grupo and pool and intentos < len(pool) * 2:
@@ -607,15 +686,13 @@ def _build_ai_prompt(perfil: Optional[PerfilSalud], dias: int, nivel: str, objet
     home = (pref.lugar or "").lower() == "casa"
     no_equipo = not pref.equipamiento
 
-    # Construir requisitos de forma concisa
     requisitos = [f"Nivel: {nivel}", f"Objetivo: {objetivos}", f"{dias} días/semana"]
 
     if home and no_equipo:
         requisitos.append("Casa sin equipo (peso corporal/bandas)")
     elif home and pref.equipamiento:
-        requisitos.append(f"Equipo: {', '.join(pref.equipamiento[:3])}")  # Limitar a 3
+        requisitos.append(f"Equipo: {', '.join(pref.equipamiento[:3])}")
 
-    # Perfil simplificado (solo lo esencial)
     perfil_items = []
     if p.datos.edad:
         perfil_items.append(f"Edad: {p.datos.edad}")
@@ -672,32 +749,19 @@ SOLO JSON válido. Sin texto extra."""
 def _resp_to_text(resp) -> str:
     """
     Extrae el texto de una respuesta de Gemini con manejo robusto de errores.
-
-    Finish Reasons:
-    - 0: FINISH_REASON_UNSPECIFIED
-    - 1: STOP (éxito)
-    - 2: MAX_TOKENS
-    - 3: SAFETY (bloqueado por seguridad)
-    - 4: RECITATION (bloqueado por contenido repetido)
-    - 5: OTHER
     """
-    # Intenta .text primero
     try:
         t = getattr(resp, "text", None)
         if t:
             return t
     except ValueError as e:
-        # Manejo específico de error de finish_reason
         if "finish_reason" in str(e).lower():
-            # Extraer finish_reason del mensaje de error
             import re
             match = re.search(r'finish_reason.*?(\d+)', str(e))
             finish_reason = int(match.group(1)) if match else None
 
-            # Obtener prompt_feedback para más detalles
             prompt_feedback = getattr(resp, "prompt_feedback", None)
 
-            # Construir mensaje de error informativo
             error_msg = f"Gemini bloqueó la respuesta. "
 
             if finish_reason == 2:
@@ -714,15 +778,12 @@ def _resp_to_text(resp) -> str:
 
             raise ValueError(error_msg)
 
-    # Candidatos (SDKs recientes)
     try:
         cands = getattr(resp, "candidates", None) or []
         if cands:
-            # Verificar finish_reason del candidato
             finish_reason = getattr(cands[0], "finish_reason", None)
 
-            # Si finish_reason indica un problema, lanzar error específico
-            if finish_reason and finish_reason != 1:  # 1 = STOP (éxito)
+            if finish_reason and finish_reason != 1:
                 prompt_feedback = getattr(resp, "prompt_feedback", None)
 
                 error_msg = f"Gemini bloqueó la respuesta (finish_reason={finish_reason}). "
@@ -739,7 +800,6 @@ def _resp_to_text(resp) -> str:
 
                 raise ValueError(error_msg)
 
-            # Si finish_reason es OK, intentar extraer el texto
             content = getattr(cands[0], "content", None)
             if content:
                 parts = getattr(content, "parts", [])
@@ -747,10 +807,9 @@ def _resp_to_text(resp) -> str:
                     return "".join([getattr(p, "text", "") for p in parts])
     except (AttributeError, IndexError, ValueError) as e:
         if isinstance(e, ValueError):
-            raise  # Re-lanzar ValueError con mensaje mejorado
+            raise
         pass
 
-    # Último recurso: intentar obtener cualquier información
     prompt_feedback = getattr(resp, "prompt_feedback", None)
     if prompt_feedback:
         raise ValueError(f"Gemini no devolvió contenido válido. Prompt feedback: {prompt_feedback}")
@@ -761,35 +820,20 @@ def _resp_to_text(resp) -> str:
 def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> Dict[str, Any]:
     """
     Genera un plan de entrenamiento usando Gemini AI con timeout configurado.
-
-    Args:
-        perfil: Perfil de salud del usuario
-        dias: Número de días de la rutina
-        nivel: Nivel de dificultad
-        objetivos: Objetivos del entrenamiento
-
-    Returns:
-        Dict con el plan de entrenamiento en formato JSON
-
-    Raises:
-        RuntimeError: Si GEMINI_API_KEY no está configurada o hay errores de cuota
     """
     if not GEMINI_API_KEY:
         raise RuntimeError("GEMINI_API_KEY no configurada")
 
     prompt = _build_ai_prompt(perfil, dias, nivel, objetivos)
 
-    # Configuración de generación con timeout y máximo de tokens
-    # Se puede configurar desde .env con GEMINI_MAX_OUTPUT_TOKENS
     max_tokens = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "4096"))
 
     generation_config = {
         "response_mime_type": "application/json",
         "temperature": 0.2,
-        "max_output_tokens": max_tokens  # Máximo: 4096 para gemini-2.5-flash
+        "max_output_tokens": max_tokens
     }
 
-    # Configuración de seguridad más permisiva (solo para contenido de fitness)
     safety_settings = [
         {
             "category": "HARM_CATEGORY_HARASSMENT",
@@ -805,26 +849,23 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
         },
         {
             "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-            "threshold": "BLOCK_ONLY_HIGH"  # Solo bloquear contenido muy peligroso
+            "threshold": "BLOCK_ONLY_HIGH"
         }
     ]
 
-    # Configuración de timeout
     request_options = {
-        "timeout": GEMINI_TIMEOUT_SECONDS  # Usar el timeout configurado
+        "timeout": GEMINI_TIMEOUT_SECONDS
     }
 
     last_err = None
     tried_models = []
 
-    # 1) Intento con el modelo seleccionado dinámicamente
     try:
         selected_model = _normalize_model_name(GEMINI_MODEL)
         tried_models.append(selected_model)
         model = genai.GenerativeModel(selected_model)
 
         try:
-            # Intentar con timeout y safety_settings
             resp = model.generate_content(
                 prompt,
                 generation_config=generation_config,
@@ -832,7 +873,6 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
                 request_options=request_options
             )
         except TypeError:
-            # Fallback sin request_options si la versión del SDK no lo soporta
             try:
                 resp = model.generate_content(
                     [prompt],
@@ -841,7 +881,6 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
                     request_options=request_options
                 )
             except TypeError:
-                # Último fallback sin timeout pero con safety_settings
                 try:
                     resp = model.generate_content(
                         [prompt],
@@ -849,7 +888,6 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
                         safety_settings=safety_settings
                     )
                 except TypeError:
-                    # Fallback final sin nada extra
                     resp = model.generate_content([prompt], generation_config=generation_config)
 
         raw = _resp_to_text(resp)
@@ -867,14 +905,12 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
 
     except Exception as e:
         last_err = e
-        # Si NO es un error de cuota, propaga tal cual
         if not _is_quota_error(e):
             raise RuntimeError(
                 f"Fallo en _gemini_generate_plan: {type(e).__name__}: {str(e)} "
                 f"(modelos probados: {tried_models})"
             )
 
-    # 2) Si fue cuota, intenta con modelo ligero (flash) una vez
     try:
         light_model = FALLBACK_LIGHT_MODEL
         tried_models.append(light_model)
@@ -918,7 +954,6 @@ def _gemini_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
             return json.loads(m.group(0))
 
     except Exception:
-        # Propaga el error original de cuota para que el endpoint decida (429/fallback)
         raise RuntimeError(
             f"Fallo en _gemini_generate_plan: {type(last_err).__name__}: {str(last_err)} "
             f"(modelos probados: {tried_models})"
@@ -952,7 +987,7 @@ def _openai_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
             ],
             temperature=0.2,
             max_tokens=2048,
-            response_format={"type": "json_object"}  # Fuerza respuesta JSON
+            response_format={"type": "json_object"}
         )
 
         raw = response.choices[0].message.content
@@ -962,7 +997,6 @@ def _openai_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, 
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            # Intenta extraer JSON del texto
             m = re.search(r"\{[\s\S]*\}", raw)
             if not m:
                 raise ValueError(f"OpenAI no devolvió JSON válido. raw (400): {raw[:400]}...")
@@ -1008,7 +1042,6 @@ def _grok_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, ob
         try:
             return json.loads(raw)
         except json.JSONDecodeError:
-            # Intenta extraer JSON del texto
             m = re.search(r"\{[\s\S]*\}", raw)
             if not m:
                 raise ValueError(f"Grok no devolvió JSON válido. raw (400): {raw[:400]}...")
@@ -1025,35 +1058,22 @@ def _grok_generate_plan(perfil: Optional[PerfilSalud], dias: int, nivel: str, ob
 def _parse_int_value(value: Any, default: int = 0) -> int:
     """
     Parsea un valor a entero, manejando casos especiales como rangos.
-
-    Ejemplos:
-    - "10" → 10
-    - 10 → 10
-    - "10-15" → 10 (toma el valor mínimo)
-    - "8-12" → 8
-    - None → default
-    - "" → default
     """
     if value is None or value == "":
         return default
 
-    # Si ya es un entero
     if isinstance(value, int):
         return value
 
-    # Convertir a string y limpiar
     value_str = str(value).strip()
 
-    # Si contiene un guión (es un rango como "10-15")
     if '-' in value_str:
         parts = value_str.split('-')
         try:
-            # Tomar el primer valor (mínimo del rango)
             return int(parts[0].strip())
         except (ValueError, IndexError):
             return default
 
-    # Si contiene "a" o "to" (ej: "8 a 12", "10 to 15")
     for separator in [' a ', ' to ', ' - ']:
         if separator in value_str.lower():
             parts = value_str.lower().split(separator)
@@ -1062,9 +1082,7 @@ def _parse_int_value(value: Any, default: int = 0) -> int:
             except (ValueError, IndexError):
                 return default
 
-    # Intentar conversión directa
     try:
-        # Extraer solo números
         import re
         numbers = re.findall(r'\d+', value_str)
         if numbers:
@@ -1091,7 +1109,6 @@ def _from_ai_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional
         if seg_local.advertencias:
             advertencias.extend([f"{d.get('nombre_dia', 'Día?')}: {a}" for a in seg_local.advertencias])
 
-        # Procesar ejercicios con validación robusta
         ejercicios_out = []
         for e in ejercicios_filtrados:
             try:
@@ -1109,7 +1126,6 @@ def _from_ai_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional
                 )
                 ejercicios_out.append(ejercicio)
             except Exception as ex:
-                # Si un ejercicio falla, log y continuar con los demás
                 print(f"⚠️ Error procesando ejercicio {e.get('nombre', '?')}: {ex}")
                 continue
 
@@ -1136,18 +1152,25 @@ def _from_ai_to_pydantic(plan: Dict[str, Any], nivel_norm: str, perfil: Optional
 # ============================================================
 
 @router.post("/generar-rutina", response_model=Dict[str, Any])
-def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = Depends(get_db)):
+def generar_rutina_distribuida(
+        solicitud: SolicitudGenerarRutina,
+        db: Session = Depends(get_db),
+        activar_vigencia: bool = Query(False, description="Activar vigencia inmediatamente")
+):
     """
     Genera una rutina con IA (Gemini/OpenAI/Grok) ajustada por perfil de salud.
-    - proveedor="auto"   -> intenta Gemini primero, si falla usa OpenAI, si falla usa Grok, si falla usa local
-    - proveedor="gemini" -> exige Gemini (si cuota 429, si otro error 502).
-    - proveedor="openai" -> exige OpenAI (si error 502).
-    - proveedor="grok"   -> exige Grok (si error 502).
-    - proveedor="local"  -> usa generador local directamente.
+    Ahora incluye sistema de caducidad/vigencia.
+
+    Parámetros:
+    - solicitud: Datos de la rutina incluyendo duracion_meses (1-12)
+    - activar_vigencia: Si es True, activa la vigencia inmediatamente
     """
     try:
         if not (2 <= solicitud.dias <= 7):
             raise HTTPException(status_code=422, detail="Días debe estar entre 2 y 7")
+
+        if not (1 <= solicitud.duracion_meses <= 12):
+            raise HTTPException(status_code=422, detail="Duración debe estar entre 1 y 12 meses")
 
         nivel_map = {"principiante": "PRINCIPIANTE", "intermedio": "INTERMEDIO", "avanzado": "AVANZADO"}
         nivel_norm = nivel_map.get(solicitud.nivel.lower(), "INTERMEDIO")
@@ -1251,7 +1274,6 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
 
         # AUTO (Cascada: Gemini -> OpenAI -> Grok -> Local)
         else:
-            # Intento 1: Gemini
             try:
                 if GEMINI_API_KEY:
                     plan_json = _gemini_generate_plan(
@@ -1268,7 +1290,6 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
             except Exception as ge:
                 print(f"⚠️ Gemini falló: {ge}")
 
-                # Intento 2: OpenAI
                 try:
                     if OPENAI_API_KEY and openai_client:
                         plan_json = _openai_generate_plan(
@@ -1285,7 +1306,6 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
                 except Exception as oe:
                     print(f"⚠️ OpenAI falló: {oe}")
 
-                    # Intento 3: Grok
                     try:
                         if GROK_API_KEY and grok_client:
                             plan_json = _grok_generate_plan(
@@ -1302,7 +1322,6 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
                     except Exception as gke:
                         print(f"⚠️ Grok falló: {gke}")
 
-                        # Intento 4: Local Fallback
                         ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
                         if not any(ejercicios_por_grupo.values()):
                             raise HTTPException(status_code=400,
@@ -1321,6 +1340,21 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
         total_ejercicios = sum(len(d.ejercicios) for d in dias)
         minutos = calcular_minutos_rutina(dias)
 
+        # NUEVO: Calcular información de vigencia
+        vigencia_info = calcular_fechas_vigencia(solicitud.duracion_meses)
+
+        if activar_vigencia:
+            estado_info = obtener_estado_vigencia(
+                vigencia_info["fecha_fin"],
+                vigencia_info["fecha_inicio"]
+            )
+        else:
+            estado_info = {
+                "estado": "pendiente",
+                "dias_restantes": vigencia_info["dias_totales"],
+                "porcentaje_completado": 0.0
+            }
+
         base = RutinaCompleta(
             nombre=f"Rutina de {nivel_norm} - {solicitud.objetivos.title()}",
             descripcion=descripcion,
@@ -1331,20 +1365,303 @@ def generar_rutina_distribuida(solicitud: SolicitudGenerarRutina, db: Session = 
             dias_semana=solicitud.dias,
             total_ejercicios=total_ejercicios,
             minutos_aproximados=minutos,
+            duracion_meses=solicitud.duracion_meses,  # NUEVO
+            fecha_inicio_vigencia=vigencia_info["fecha_inicio"].isoformat() if activar_vigencia else None,
+            fecha_fin_vigencia=vigencia_info["fecha_fin"].isoformat(),
+            estado_vigencia=estado_info["estado"],
             dias=dias,
             fecha_creacion=datetime.now().isoformat(),
             generada_por=generada_por
         )
 
-        return {**base.model_dump(), "seguridad": seguridad.model_dump(), "proveedor": prov}
+        response = {
+            **base.model_dump(),
+            "seguridad": seguridad.model_dump(),
+            "proveedor": prov,
+            "vigencia": {
+                "duracion_meses": solicitud.duracion_meses,
+                "duracion_dias": vigencia_info["dias_totales"],
+                "fecha_inicio": vigencia_info[
+                    "fecha_inicio"].isoformat() if activar_vigencia else "Pendiente de asignación",
+                "fecha_fin": vigencia_info["fecha_fin"].isoformat(),
+                "dias_restantes": estado_info["dias_restantes"],
+                "estado": estado_info["estado"],
+                "porcentaje_completado": estado_info["porcentaje_completado"],
+                "activada": activar_vigencia
+            }
+        }
+
+        return response
 
     except HTTPException:
         raise
     except Exception as e:
-        import traceback;
+        import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Error al generar rutina: {str(e)}")
 
+
+# ============================================================
+# NUEVOS ENDPOINTS - GESTIÓN DE VIGENCIA
+# ============================================================
+
+@router.post("/rutinas/{id_rutina}/activar-vigencia")
+def activar_vigencia_rutina(
+        id_rutina: int,
+        duracion_meses: Optional[int] = Query(None, ge=1, le=12),
+        db: Session = Depends(get_db)
+):
+    """
+    Activa la vigencia de una rutina, estableciendo fecha de inicio y fin.
+    Si no se especifica duración, usa la configurada en la rutina.
+    """
+    try:
+        query = text("SELECT duracion_meses, estado_vigencia FROM rutinas WHERE id_rutina = :id")
+        result = db.execute(query, {"id": id_rutina}).fetchone()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Rutina no encontrada")
+
+        duracion_actual, estado_actual = result
+
+        meses = duracion_meses if duracion_meses else duracion_actual
+
+        if not (1 <= meses <= 12):
+            raise HTTPException(status_code=422, detail="Duración debe estar entre 1 y 12 meses")
+
+        vigencia = calcular_fechas_vigencia(meses)
+
+        update_query = text("""
+            UPDATE rutinas 
+            SET duracion_meses = :duracion,
+                fecha_inicio_vigencia = :fecha_inicio,
+                fecha_fin_vigencia = :fecha_fin,
+                estado_vigencia = 'activa'
+            WHERE id_rutina = :id
+        """)
+
+        db.execute(update_query, {
+            "id": id_rutina,
+            "duracion": meses,
+            "fecha_inicio": vigencia["fecha_inicio"],
+            "fecha_fin": vigencia["fecha_fin"]
+        })
+
+        db.commit()
+
+        estado_info = obtener_estado_vigencia(vigencia["fecha_fin"], vigencia["fecha_inicio"])
+
+        return {
+            "id_rutina": id_rutina,
+            "mensaje": "Vigencia activada exitosamente",
+            "vigencia": {
+                "duracion_meses": meses,
+                "fecha_inicio": vigencia["fecha_inicio"].isoformat(),
+                "fecha_fin": vigencia["fecha_fin"].isoformat(),
+                "dias_totales": vigencia["dias_totales"],
+                "dias_restantes": estado_info["dias_restantes"],
+                "estado": estado_info["estado"]
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al activar vigencia: {str(e)}")
+
+
+@router.post("/rutinas/{id_rutina}/extender-vigencia")
+async def extender_vigencia(
+    id_rutina: int,
+    data: ExtenderVigenciaRequest,
+    db: Session = Depends(get_db),
+):
+    meses_adicionales = data.meses_adicionales
+
+    query = text("""
+        UPDATE rutinas
+        SET vigencia_meses = vigencia_meses + :meses
+        WHERE id_rutina = :id_rutina
+    """)
+
+    db.execute(query, {
+        "id_rutina": id_rutina,
+        "meses": meses_adicionales
+    })
+    db.commit()
+
+    return {
+        "success": True,
+        "mensaje": f"La vigencia fue extendida {meses_adicionales} meses."
+    }
+
+
+@router.get("/rutinas/{id_rutina}/vigencia")
+def consultar_vigencia_rutina(id_rutina: int, db: Session = Depends(get_db)):
+    """
+    Consulta el estado de vigencia de una rutina específica.
+    """
+    try:
+        query = text("""
+            SELECT 
+                id_rutina, nombre, duracion_meses,
+                fecha_inicio_vigencia, fecha_fin_vigencia, estado_vigencia
+            FROM rutinas
+            WHERE id_rutina = :id
+        """)
+
+        result = db.execute(query, {"id": id_rutina}).fetchone()
+
+        if not result:
+            raise HTTPException(status_code=404, detail="Rutina no encontrada")
+
+        id_r, nombre, duracion, fecha_inicio, fecha_fin, estado = result
+
+        if not fecha_inicio or not fecha_fin:
+            return {
+                "id_rutina": id_r,
+                "nombre": nombre,
+                "duracion_meses": duracion,
+                "estado": "pendiente",
+                "mensaje": "La rutina no ha sido activada aún"
+            }
+
+        estado_info = obtener_estado_vigencia(fecha_fin, fecha_inicio)
+        ahora = datetime.now()
+
+        return {
+            "id_rutina": id_r,
+            "nombre": nombre,
+            "vigencia": {
+                "duracion_meses": duracion,
+                "fecha_inicio": fecha_inicio.isoformat(),
+                "fecha_fin": fecha_fin.isoformat(),
+                "dias_totales": (fecha_fin - fecha_inicio).days,
+                "dias_transcurridos": (ahora - fecha_inicio).days,
+                "dias_restantes": estado_info["dias_restantes"],
+                "porcentaje_completado": estado_info["porcentaje_completado"],
+                "estado": estado_info["estado"],
+                "estado_db": estado
+            }
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al consultar vigencia: {str(e)}")
+
+
+@router.get("/rutinas/por-vencer")
+def listar_rutinas_por_vencer(
+        dias_aviso: int = Query(7, ge=1, le=30),
+        id_entrenador: Optional[int] = None,
+        db: Session = Depends(get_db)
+):
+    """
+    Lista las rutinas que están por vencer en los próximos N días.
+    """
+    try:
+        fecha_limite = datetime.now() + timedelta(days=dias_aviso)
+
+        query = text("""
+            SELECT 
+                r.id_rutina, r.nombre, r.duracion_meses,
+                r.fecha_inicio_vigencia, r.fecha_fin_vigencia,
+                r.estado_vigencia, r.creado_por,
+                u.nombre as nombre_entrenador,
+                u.apellido as apellido_entrenador
+            FROM rutinas r
+            LEFT JOIN usuarios u ON r.creado_por = u.id_usuario
+            WHERE r.fecha_fin_vigencia IS NOT NULL
+              AND r.fecha_fin_vigencia BETWEEN NOW() AND :fecha_limite
+              AND r.estado_vigencia IN ('activa', 'por_vencer', 'extendida')
+              AND (:id_entrenador IS NULL OR r.creado_por = :id_entrenador)
+            ORDER BY r.fecha_fin_vigencia ASC
+        """)
+
+        results = db.execute(query, {
+            "fecha_limite": fecha_limite,
+            "id_entrenador": id_entrenador
+        }).fetchall()
+
+        rutinas = []
+        for row in results:
+            estado_info = obtener_estado_vigencia(row[4], row[3])
+            rutinas.append({
+                "id_rutina": row[0],
+                "nombre": row[1],
+                "duracion_meses": row[2],
+                "fecha_fin": row[4].isoformat(),
+                "dias_restantes": estado_info["dias_restantes"],
+                "porcentaje_completado": estado_info["porcentaje_completado"],
+                "estado": estado_info["estado"],
+                "entrenador": f"{row[7]} {row[8]}" if row[7] else "Desconocido"
+            })
+
+        return {
+            "total": len(rutinas),
+            "dias_aviso": dias_aviso,
+            "fecha_consulta": datetime.now().isoformat(),
+            "rutinas": rutinas
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al listar rutinas: {str(e)}")
+
+
+@router.get("/rutinas/vencidas")
+def listar_rutinas_vencidas(
+        id_entrenador: Optional[int] = None,
+        db: Session = Depends(get_db)
+):
+    """
+    Lista las rutinas que ya vencieron.
+    """
+    try:
+        query = text("""
+            SELECT 
+                r.id_rutina, r.nombre, r.duracion_meses,
+                r.fecha_inicio_vigencia, r.fecha_fin_vigencia,
+                r.creado_por,
+                u.nombre as nombre_entrenador,
+                u.apellido as apellido_entrenador
+            FROM rutinas r
+            LEFT JOIN usuarios u ON r.creado_por = u.id_usuario
+            WHERE r.fecha_fin_vigencia < NOW()
+              AND (:id_entrenador IS NULL OR r.creado_por = :id_entrenador)
+            ORDER BY r.fecha_fin_vigencia DESC
+        """)
+
+        results = db.execute(query, {"id_entrenador": id_entrenador}).fetchall()
+
+        rutinas = []
+        ahora = datetime.now()
+        for row in results:
+            dias_vencida = (ahora - row[4]).days
+            rutinas.append({
+                "id_rutina": row[0],
+                "nombre": row[1],
+                "duracion_meses": row[2],
+                "fecha_inicio": row[3].isoformat() if row[3] else None,
+                "fecha_fin": row[4].isoformat(),
+                "dias_vencida": dias_vencida,
+                "entrenador": f"{row[6]} {row[7]}" if row[6] else "Desconocido"
+            })
+
+        return {
+            "total": len(rutinas),
+            "fecha_consulta": ahora.isoformat(),
+            "rutinas": rutinas
+        }
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error al listar rutinas vencidas: {str(e)}")
+
+
+# ============================================================
+# ENDPOINTS ORIGINALES - DEBUG Y STATUS
+# ============================================================
 
 @router.get("/gemini/debug")
 def gemini_debug():

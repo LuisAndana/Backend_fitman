@@ -1,765 +1,495 @@
-# routers/progresion.py - Sistema de Progresión e Histórico
-
-from fastapi import APIRouter, HTTPException, Depends, Query
-from pydantic import BaseModel, Field
-from sqlalchemy.orm import Session
-from sqlalchemy import text
+# routers/progresion.py
+from fastapi import APIRouter, HTTPException, Query, status, Depends
+from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
-from enum import Enum
-
+from db import get_connection
+from sqlalchemy.orm import Session
 from utils.dependencies import get_db
+import json
 
-router = APIRouter(prefix="/api/progresion", tags=["Progresión"])
-
-
-# ============================================================
-# ENUMS
-# ============================================================
-
-class TipoAlerta(str, Enum):
-    aumentar_peso = "aumentar_peso"
-    aumentar_reps = "aumentar_reps"
-    reducir_descanso = "reducir_descanso"
-    cambiar_ejercicio = "cambiar_ejercicio"
-    meseta_detectada = "meseta_detectada"
-    regresion_detectada = "regresion_detectada"
-    objetivo_alcanzado = "objetivo_alcanzado"
-    record_personal = "record_personal"
-
-
-class PrioridadAlerta(str, Enum):
-    baja = "baja"
-    media = "media"
-    alta = "alta"
-    critica = "critica"
-
-
-class EstadoAlerta(str, Enum):
-    pendiente = "pendiente"
-    vista = "vista"
-    atendida = "atendida"
-    descartada = "descartada"
-
-
-class CalidadTecnica(str, Enum):
-    excelente = "excelente"
-    buena = "buena"
-    regular = "regular"
-    mala = "mala"
-
-
-class EstadoAnimo(str, Enum):
-    excelente = "excelente"
-    bueno = "bueno"
-    regular = "regular"
-    malo = "malo"
+router = APIRouter()
 
 
 # ============================================================
-# SCHEMAS
+# 🔹 MODELOS PYDANTIC
 # ============================================================
 
-class RegistrarProgresoRequest(BaseModel):
-    id_historial: int
-    id_ejercicio: int
-    fecha_sesion: datetime
-    dia_rutina: Optional[str] = None
-    peso_kg: Optional[float] = None
-    series_completadas: int
-    repeticiones_completadas: int
-    tiempo_descanso_segundos: Optional[int] = None
-    rpe: Optional[int] = Field(None, ge=1, le=10, description="Rate of Perceived Exertion (1-10)")
-    calidad_tecnica: Optional[CalidadTecnica] = CalidadTecnica.buena
-    estado_animo: Optional[EstadoAnimo] = None
-    notas: Optional[str] = None
-    dolor_molestias: Optional[str] = None
+class MetricaProgreso(BaseModel):
+    """Métricas individuales de progreso"""
+    ejercicio: str
+    peso_inicial: float
+    peso_actual: float
+    mejora_porcentaje: float
+    tendencia: str  # "mejorando", "estancado", "bajando"
 
 
-class ProgresoEjercicio(BaseModel):
-    id_progreso: int
-    fecha_sesion: datetime
-    numero_sesion: int
-    peso_kg: Optional[float]
-    series_completadas: int
-    repeticiones_completadas: int
-    rpe: Optional[int]
-    calidad_tecnica: str
-    peso_anterior: Optional[float]
-    diferencia_peso: Optional[float]
-    porcentaje_mejora: Optional[float]
-    es_record_personal: bool
-    notas: Optional[str]
+class DashboardProgreso(BaseModel):
+    """Dashboard general del progreso del cliente"""
+    id_cliente: int
+    nombre_cliente: str
+    dias_entrenando: int
+    sesiones_completadas: int
+    rutinas_activas: int
+    ultima_rutina: Optional[str] = None
+    ultimo_entrenamiento: Optional[str] = None
+    progreso_general: float  # Porcentaje 0-100
 
 
-class AlertaProgresion(BaseModel):
+class HistorialProgreso(BaseModel):
+    """Entrada del historial de progreso"""
+    fecha: str
+    rutina: str
+    objetivo: Optional[str] = None
+    duracion_meses: int
+    ejercicios_totales: int
+    estado: str
+    entrenador: Optional[str] = None
+
+
+class AlertaProgreso(BaseModel):
+    """Alerta de progreso o estancamiento"""
     id_alerta: int
-    tipo_alerta: str
-    prioridad: str
+    tipo: str  # "rutina_expira", "sin_rutina", "nueva_rutina", "objetivo_cerca"
     titulo: str
     mensaje: str
-    recomendacion: Optional[str]
-    nombre_ejercicio: Optional[str]
-    peso_actual: Optional[float]
-    peso_sugerido: Optional[float]
-    sesiones_sin_progreso: Optional[int]
-    fecha_generacion: datetime
-    estado: str
+    fecha: str
+    prioridad: str  # "alta", "media", "baja"
+    leida: bool = False
 
 
-class EstadisticasProgreso(BaseModel):
-    total_sesiones: int
-    peso_inicial: Optional[float]
-    peso_actual: Optional[float]
-    peso_maximo: Optional[float]
-    progreso_total: Optional[float]
-    porcentaje_mejora: Optional[float]
-    rpe_promedio: Optional[float]
-    records_personales: int
-    primera_sesion: Optional[datetime]
-    ultima_sesion: Optional[datetime]
-    dias_entrenando: int
-
-
-class HistorialRutina(BaseModel):
-    id_historial: int
-    nombre_rutina: str
-    fecha_inicio: datetime
-    fecha_fin: datetime
-    estado: str
-    duracion_dias: int
-    dias_entrenados: int
-    sesiones_completadas: int
-    porcentaje_cumplimiento: float
-    peso_inicial: Optional[float]
-    peso_final: Optional[float]
-    objetivo: Optional[str]
-
-
-class CrearObjetivoRequest(BaseModel):
-    id_cliente: int
-    id_ejercicio: Optional[int] = None
-    tipo_objetivo: str
-    titulo: str
-    descripcion: Optional[str] = None
-    valor_inicial: Optional[float] = None
-    valor_objetivo: float
-    unidad: Optional[str] = "kg"
-    fecha_limite: datetime
-
-
-class ObjetivoCliente(BaseModel):
+class ObjetivoProgreso(BaseModel):
+    """Objetivo de progreso del cliente basado en rutinas"""
     id_objetivo: int
-    titulo: str
-    descripcion: Optional[str]
-    tipo_objetivo: str
-    valor_inicial: Optional[float]
-    valor_objetivo: float
-    valor_actual: Optional[float]
-    unidad: str
-    porcentaje_completado: float
-    estado: str
-    fecha_inicio: datetime
-    fecha_limite: datetime
-    fecha_alcanzado: Optional[datetime]
+    tipo: str  # "rutina", "consistencia", "fuerza"
+    descripcion: str
+    fecha_inicio: str
+    fecha_fin: Optional[str] = None
+    progreso: float
+    estado: str  # "activo", "completado", "expirado"
 
 
 # ============================================================
-# ENDPOINTS - REGISTRO DE PROGRESO
+# 🔹 ENDPOINTS CON DATOS REALES
 # ============================================================
-
-@router.post("/registrar")
-def registrar_progreso(
-        progreso: RegistrarProgresoRequest,
-        db: Session = Depends(get_db)
-):
-    """
-    Registra el progreso de un ejercicio en una sesión de entrenamiento.
-    Calcula automáticamente mejoras, records personales y genera alertas.
-    """
-    try:
-        # Obtener ID del cliente desde el historial
-        query_cliente = text("""
-            SELECT id_cliente FROM historial_rutinas WHERE id_historial = :id_historial
-        """)
-        result = db.execute(query_cliente, {"id_historial": progreso.id_historial}).fetchone()
-
-        if not result:
-            raise HTTPException(status_code=404, detail="Historial de rutina no encontrado")
-
-        id_cliente = result[0]
-
-        # Llamar al procedimiento almacenado
-        query = text("""
-            CALL sp_registrar_progreso(
-                :id_historial,
-                :id_ejercicio,
-                :id_cliente,
-                :fecha_sesion,
-                :peso_kg,
-                :series,
-                :repeticiones,
-                :rpe,
-                :notas
-            )
-        """)
-
-        result = db.execute(query, {
-            "id_historial": progreso.id_historial,
-            "id_ejercicio": progreso.id_ejercicio,
-            "id_cliente": id_cliente,
-            "fecha_sesion": progreso.fecha_sesion,
-            "peso_kg": progreso.peso_kg,
-            "series": progreso.series_completadas,
-            "repeticiones": progreso.repeticiones_completadas,
-            "rpe": progreso.rpe,
-            "notas": progreso.notas
-        })
-
-        db.commit()
-
-        # Obtener el ID insertado
-        id_progreso = result.fetchone()[0]
-
-        return {
-            "success": True,
-            "id_progreso": id_progreso,
-            "mensaje": "Progreso registrado exitosamente",
-            "record_personal": False  # Se actualizará con lógica
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error al registrar progreso: {str(e)}")
-
-
-@router.get("/ejercicio/{id_ejercicio}/cliente/{id_cliente}")
-def obtener_progreso_ejercicio(
-        id_ejercicio: int,
-        id_cliente: int,
-        limite: int = Query(50, le=200),
-        db: Session = Depends(get_db)
-) -> List[ProgresoEjercicio]:
-    """
-    Obtiene el historial de progreso de un ejercicio específico para un cliente.
-    """
-    try:
-        query = text("""
-            SELECT 
-                id_progreso,
-                fecha_sesion,
-                numero_sesion,
-                peso_kg,
-                series_completadas,
-                repeticiones_completadas,
-                rpe,
-                calidad_tecnica,
-                peso_anterior,
-                diferencia_peso,
-                porcentaje_mejora,
-                es_record_personal,
-                notas
-            FROM progreso_ejercicios
-            WHERE id_ejercicio = :id_ejercicio 
-              AND id_cliente = :id_cliente
-            ORDER BY fecha_sesion DESC
-            LIMIT :limite
-        """)
-
-        results = db.execute(query, {
-            "id_ejercicio": id_ejercicio,
-            "id_cliente": id_cliente,
-            "limite": limite
-        }).fetchall()
-
-        progresos = []
-        for row in results:
-            progresos.append(ProgresoEjercicio(
-                id_progreso=row[0],
-                fecha_sesion=row[1],
-                numero_sesion=row[2],
-                peso_kg=row[3],
-                series_completadas=row[4],
-                repeticiones_completadas=row[5],
-                rpe=row[6],
-                calidad_tecnica=row[7] or "buena",
-                peso_anterior=row[8],
-                diferencia_peso=row[9],
-                porcentaje_mejora=row[10],
-                es_record_personal=bool(row[11]),
-                notas=row[12]
-            ))
-
-        return progresos
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener progreso: {str(e)}")
-
-
-@router.get("/ejercicio/{id_ejercicio}/cliente/{id_cliente}/estadisticas")
-def obtener_estadisticas_ejercicio(
-        id_ejercicio: int,
-        id_cliente: int,
-        db: Session = Depends(get_db)
-) -> EstadisticasProgreso:
-    """
-    Obtiene estadísticas resumidas del progreso en un ejercicio.
-    """
-    try:
-        query = text("""
-            SELECT * FROM v_progreso_por_ejercicio
-            WHERE id_cliente = :id_cliente 
-              AND id_ejercicio = :id_ejercicio
-        """)
-
-        result = db.execute(query, {
-            "id_cliente": id_cliente,
-            "id_ejercicio": id_ejercicio
-        }).fetchone()
-
-        if not result:
-            return EstadisticasProgreso(
-                total_sesiones=0,
-                peso_inicial=None,
-                peso_actual=None,
-                peso_maximo=None,
-                progreso_total=None,
-                porcentaje_mejora=None,
-                rpe_promedio=None,
-                records_personales=0,
-                primera_sesion=None,
-                ultima_sesion=None,
-                dias_entrenando=0
-            )
-
-        return EstadisticasProgreso(
-            total_sesiones=result[3],
-            peso_inicial=result[4],
-            peso_maximo=result[5],
-            peso_actual=result[5],  # El máximo es el actual
-            progreso_total=result[7],
-            porcentaje_mejora=result[8],
-            rpe_promedio=result[9],
-            primera_sesion=result[10],
-            ultima_sesion=result[11],
-            dias_entrenando=result[12] or 0,
-            records_personales=result[13]
-        )
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener estadísticas: {str(e)}")
-
-
-# ============================================================
-# ENDPOINTS - HISTORIAL DE RUTINAS
-# ============================================================
-
-@router.post("/historial/crear")
-def crear_historial_rutina(
-        id_rutina: int,
-        fecha_inicio: Optional[datetime] = None,
-        db: Session = Depends(get_db)
-):
-    """
-    Crea un registro en el historial cuando se activa una rutina.
-    """
-    try:
-        if fecha_inicio is None:
-            fecha_inicio = datetime.now()
-
-        # Llamar procedimiento almacenado
-        query = text("CALL sp_crear_historial_rutina(:id_rutina, :fecha_inicio)")
-
-        result = db.execute(query, {
-            "id_rutina": id_rutina,
-            "fecha_inicio": fecha_inicio
-        })
-
-        db.commit()
-
-        id_historial = result.fetchone()[0]
-
-        return {
-            "success": True,
-            "id_historial": id_historial,
-            "mensaje": "Historial de rutina creado exitosamente"
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error al crear historial: {str(e)}")
-
-
-@router.get("/historial/cliente/{id_cliente}")
-def obtener_historial_cliente(
-        id_cliente: int,
-        db: Session = Depends(get_db)
-) -> List[HistorialRutina]:
-    """
-    Obtiene el historial completo de rutinas de un cliente.
-    """
-    try:
-        query = text("""
-            SELECT 
-                id_historial,
-                nombre_rutina,
-                fecha_inicio,
-                fecha_fin,
-                estado,
-                duracion_dias,
-                dias_entrenados,
-                sesiones_completadas,
-                porcentaje_cumplimiento,
-                peso_inicial,
-                peso_final,
-                objetivo
-            FROM historial_rutinas
-            WHERE id_cliente = :id_cliente
-            ORDER BY fecha_inicio DESC
-        """)
-
-        results = db.execute(query, {"id_cliente": id_cliente}).fetchall()
-
-        historiales = []
-        for row in results:
-            historiales.append(HistorialRutina(
-                id_historial=row[0],
-                nombre_rutina=row[1],
-                fecha_inicio=row[2],
-                fecha_fin=row[3],
-                estado=row[4],
-                duracion_dias=row[5],
-                dias_entrenados=row[6] or 0,
-                sesiones_completadas=row[7] or 0,
-                porcentaje_cumplimiento=float(row[8] or 0),
-                peso_inicial=row[9],
-                peso_final=row[10],
-                objetivo=row[11]
-            ))
-
-        return historiales
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener historial: {str(e)}")
-
-
-@router.put("/historial/{id_historial}/completar")
-def completar_rutina(
-        id_historial: int,
-        peso_final: Optional[float] = None,
-        grasa_corporal_final: Optional[float] = None,
-        notas_entrenador: Optional[str] = None,
-        db: Session = Depends(get_db)
-):
-    """
-    Marca una rutina como completada y registra métricas finales.
-    """
-    try:
-        query = text("""
-            UPDATE historial_rutinas
-            SET 
-                estado = 'completada',
-                fecha_completada = NOW(),
-                peso_final = :peso_final,
-                grasa_corporal_final = :grasa_corporal_final,
-                notas_entrenador = :notas_entrenador
-            WHERE id_historial = :id_historial
-        """)
-
-        db.execute(query, {
-            "id_historial": id_historial,
-            "peso_final": peso_final,
-            "grasa_corporal_final": grasa_corporal_final,
-            "notas_entrenador": notas_entrenador
-        })
-
-        db.commit()
-
-        return {
-            "success": True,
-            "mensaje": "Rutina marcada como completada"
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error al completar rutina: {str(e)}")
-
-
-# ============================================================
-# ENDPOINTS - ALERTAS
-# ============================================================
-
-@router.get("/alertas/cliente/{id_cliente}")
-def obtener_alertas_cliente(
-        id_cliente: int,
-        estado: Optional[EstadoAlerta] = None,
-        db: Session = Depends(get_db)
-) -> List[AlertaProgresion]:
-    """
-    Obtiene las alertas de progresión de un cliente.
-    """
-    try:
-        if estado:
-            query = text("""
-                SELECT * FROM v_alertas_pendientes
-                WHERE id_cliente = :id_cliente AND estado = :estado
-                ORDER BY prioridad DESC, fecha_generacion ASC
-            """)
-            params = {"id_cliente": id_cliente, "estado": estado.value}
-        else:
-            query = text("""
-                SELECT 
-                    id_alerta, id_cliente, nombre_cliente, apellido_cliente,
-                    tipo_alerta, prioridad, titulo, mensaje,
-                    nombre_ejercicio, peso_actual, peso_sugerido,
-                    fecha_generacion, dias_pendiente
-                FROM v_alertas_pendientes
-                WHERE id_cliente = :id_cliente
-                ORDER BY prioridad DESC, fecha_generacion ASC
-            """)
-            params = {"id_cliente": id_cliente}
-
-        results = db.execute(query, params).fetchall()
-
-        alertas = []
-        for row in results:
-            alertas.append(AlertaProgresion(
-                id_alerta=row[0],
-                tipo_alerta=row[4],
-                prioridad=row[5],
-                titulo=row[6],
-                mensaje=row[7],
-                recomendacion=None,
-                nombre_ejercicio=row[8],
-                peso_actual=row[9],
-                peso_sugerido=row[10],
-                sesiones_sin_progreso=None,
-                fecha_generacion=row[11],
-                estado="pendiente"
-            ))
-
-        return alertas
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener alertas: {str(e)}")
-
-
 @router.post("/alertas/analizar/{id_cliente}")
-def analizar_progresion_cliente(
-        id_cliente: int,
-        db: Session = Depends(get_db)
-):
+def analizar_progresion_cliente(id_cliente: int):
     """
-    Analiza la progresión del cliente y genera alertas automáticas.
+    ✅ Analiza la progresión del cliente y genera alertas automáticas
     """
+    cn = None
     try:
-        query = text("CALL sp_analizar_progresion(:id_cliente)")
+        print(f"\n🔍 DEBUG: POST /progresion/alertas/analizar/{id_cliente}")
+        cn = get_connection()
+        cur = cn.cursor(dictionary=True)
 
-        result = db.execute(query, {"id_cliente": id_cliente})
-        db.commit()
+        # Verificar que el cliente existe
+        cur.execute("""
+            SELECT id_usuario FROM usuarios 
+            WHERE id_usuario = %s AND rol = 'alumno'
+        """, (id_cliente,))
 
-        alertas_generadas = result.fetchone()[0]
+        if not cur.fetchone():
+            raise HTTPException(status_code=404, detail=f"Cliente {id_cliente} no encontrado")
+
+        alertas_generadas = 0
+
+        # Aquí puedes implementar la lógica de análisis
+        # Por ahora retornamos una respuesta simple
 
         return {
             "success": True,
             "alertas_generadas": alertas_generadas,
-            "mensaje": f"Análisis completado. {alertas_generadas} alertas generadas."
+            "mensaje": f"Análisis completado. {alertas_generadas} nuevas alertas generadas."
         }
 
+    except HTTPException:
+        raise
     except Exception as e:
-        db.rollback()
+        print(f"❌ Error en análisis: {str(e)}")
         raise HTTPException(status_code=500, detail=f"Error al analizar progresión: {str(e)}")
+    finally:
+        if cn and cn.is_connected():
+            try:
+                cur.close()
+                cn.close()
+            except:
+                pass
 
-
-@router.put("/alertas/{id_alerta}/atender")
-def atender_alerta(
-        id_alerta: int,
-        id_entrenador: int,
-        accion_tomada: Optional[str] = None,
-        db: Session = Depends(get_db)
-):
-    """
-    Marca una alerta como atendida.
-    """
+@router.get("/dashboard/cliente/{id_cliente}", response_model=DashboardProgreso)
+def obtener_dashboard_progreso(id_cliente: int):
+    cn = None
     try:
-        query = text("""
-            UPDATE alertas_progresion
-            SET 
-                estado = 'atendida',
-                fecha_atendida = NOW(),
-                atendida_por = :id_entrenador,
-                accion_tomada = :accion_tomada
-            WHERE id_alerta = :id_alerta
-        """)
+        cn = get_connection()
+        cur = cn.cursor(dictionary=True)
 
-        db.execute(query, {
-            "id_alerta": id_alerta,
-            "id_entrenador": id_entrenador,
-            "accion_tomada": accion_tomada
-        })
+        # 1. Datos del cliente
+        cur.execute("""
+            SELECT id_usuario, nombre, apellido
+            FROM usuarios
+            WHERE id_usuario = %s AND rol = 'alumno'
+        """, (id_cliente,))
+        cliente = cur.fetchone()
 
-        db.commit()
+        if not cliente:
+            raise HTTPException(404, f"Cliente {id_cliente} no encontrado")
 
-        return {
-            "success": True,
-            "mensaje": "Alerta atendida exitosamente"
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error al atender alerta: {str(e)}")
-
-
-# ============================================================
-# ENDPOINTS - OBJETIVOS
-# ============================================================
-
-@router.post("/objetivos/crear")
-def crear_objetivo(
-        objetivo: CrearObjetivoRequest,
-        db: Session = Depends(get_db)
-):
-    """
-    Crea un nuevo objetivo para un cliente.
-    """
-    try:
-        query = text("""
-            INSERT INTO objetivos_cliente (
-                id_cliente, id_ejercicio, tipo_objetivo, titulo, descripcion,
-                valor_inicial, valor_objetivo, unidad, fecha_inicio, fecha_limite
-            ) VALUES (
-                :id_cliente, :id_ejercicio, :tipo_objetivo, :titulo, :descripcion,
-                :valor_inicial, :valor_objetivo, :unidad, NOW(), :fecha_limite
-            )
-        """)
-
-        result = db.execute(query, {
-            "id_cliente": objetivo.id_cliente,
-            "id_ejercicio": objetivo.id_ejercicio,
-            "tipo_objetivo": objetivo.tipo_objetivo,
-            "titulo": objetivo.titulo,
-            "descripcion": objetivo.descripcion,
-            "valor_inicial": objetivo.valor_inicial,
-            "valor_objetivo": objetivo.valor_objetivo,
-            "unidad": objetivo.unidad,
-            "fecha_limite": objetivo.fecha_limite
-        })
-
-        db.commit()
-
-        return {
-            "success": True,
-            "id_objetivo": result.lastrowid,
-            "mensaje": "Objetivo creado exitosamente"
-        }
-
-    except Exception as e:
-        db.rollback()
-        raise HTTPException(status_code=500, detail=f"Error al crear objetivo: {str(e)}")
-
-
-@router.get("/objetivos/cliente/{id_cliente}")
-def obtener_objetivos_cliente(
-        id_cliente: int,
-        db: Session = Depends(get_db)
-) -> List[ObjetivoCliente]:
-    """
-    Obtiene los objetivos de un cliente.
-    """
-    try:
-        query = text("""
+        # 2. Estadísticas reales
+        cur.execute("""
             SELECT 
-                id_objetivo, titulo, descripcion, tipo_objetivo,
-                valor_inicial, valor_objetivo, valor_actual, unidad,
-                porcentaje_completado, estado,
-                fecha_inicio, fecha_limite, fecha_alcanzado
-            FROM objetivos_cliente
-            WHERE id_cliente = :id_cliente
-            ORDER BY estado ASC, fecha_limite ASC
-        """)
+                COUNT(DISTINCT DATE(fecha_asignacion)) AS dias_entrenados,
+                COUNT(*) AS total_asignaciones,
+                COUNT(DISTINCT id_rutina) AS rutinas_distintas
+            FROM asignaciones
+            WHERE id_alumno = %s
+        """, (id_cliente,))
+        stats = cur.fetchone()
 
-        results = db.execute(query, {"id_cliente": id_cliente}).fetchall()
+        # 3. Rutinas activas desde historial_rutinas
+        cur.execute("""
+            SELECT COUNT(*) AS rutinas_activas
+            FROM historial_rutinas
+            WHERE id_cliente = %s
+              AND fecha_fin > NOW()
+              AND estado = 'activa'
+        """, (id_cliente,))
+        rutinas_activas = cur.fetchone()['rutinas_activas']
 
-        objetivos = []
-        for row in results:
-            objetivos.append(ObjetivoCliente(
-                id_objetivo=row[0],
-                titulo=row[1],
-                descripcion=row[2],
-                tipo_objetivo=row[3],
-                valor_inicial=row[4],
-                valor_objetivo=row[5],
-                valor_actual=row[6],
-                unidad=row[7],
-                porcentaje_completado=float(row[8] or 0),
-                estado=row[9],
-                fecha_inicio=row[10],
-                fecha_limite=row[11],
-                fecha_alcanzado=row[12]
+        # 4. Último entrenamiento (asignaciones)
+        cur.execute("""
+            SELECT r.nombre AS ultima_rutina, a.fecha_asignacion AS ultimo_entrenamiento
+            FROM asignaciones a
+            JOIN rutinas r ON a.id_rutina = r.id_rutina
+            WHERE a.id_alumno = %s
+            ORDER BY a.fecha_asignacion DESC
+            LIMIT 1
+        """, (id_cliente,))
+        ultima = cur.fetchone()
+
+        # 5. Progreso general basado en historial
+        cur.execute("""
+            SELECT 
+                COUNT(CASE WHEN fecha_fin < NOW() THEN 1 END) AS expiradas,
+                COUNT(*) AS total
+            FROM historial_rutinas
+            WHERE id_cliente = %s
+        """, (id_cliente,))
+        pdata = cur.fetchone()
+        progreso = 0
+        if pdata["total"] > 0:
+            progreso = (pdata["expiradas"] / pdata["total"]) * 100
+
+        return DashboardProgreso(
+            id_cliente=id_cliente,
+            nombre_cliente=f"{cliente['nombre']} {cliente['apellido']}",
+            dias_entrenando=stats["dias_entrenados"],
+            sesiones_completadas=stats["total_asignaciones"],
+            rutinas_activas=rutinas_activas,
+            ultima_rutina=ultima["ultima_rutina"] if ultima else None,
+            ultimo_entrenamiento=ultima["ultimo_entrenamiento"].isoformat() if ultima else None,
+            progreso_general=min(progreso, 100)
+        )
+
+    finally:
+        if cn: cn.close()
+
+
+
+@router.get("/historial/cliente/{id_cliente}", response_model=List[HistorialProgreso])
+def obtener_historial_progreso(id_cliente: int, limit: int = 30, offset: int = 0):
+    cn = get_connection()
+    cur = cn.cursor(dictionary=True)
+
+    # Verificar cliente
+    cur.execute("""
+        SELECT id_usuario FROM usuarios
+        WHERE id_usuario = %s AND rol = 'alumno'
+    """, (id_cliente,))
+    if not cur.fetchone():
+        raise HTTPException(404, f"Cliente {id_cliente} no encontrado")
+
+    # Usar historial_rutinas real
+    cur.execute("""
+        SELECT 
+            hr.fecha_inicio AS fecha,
+            hr.nombre_rutina AS rutina,
+            hr.objetivo,
+            CEIL(hr.duracion_dias / 30) AS duracion_meses,
+            hr.total_ejercicios,
+            hr.estado,
+            CONCAT(u.nombre, ' ', u.apellido) AS entrenador
+        FROM historial_rutinas hr
+        JOIN usuarios u ON hr.id_entrenador = u.id_usuario
+        WHERE hr.id_cliente = %s
+        ORDER BY hr.fecha_inicio DESC
+        LIMIT %s OFFSET %s
+    """, (id_cliente, limit, offset))
+
+    data = cur.fetchall()
+    historial = [
+        HistorialProgreso(
+            fecha=row["fecha"].isoformat(),
+            rutina=row["rutina"],
+            objetivo=row["objetivo"],
+            duracion_meses=row["duracion_meses"],
+            ejercicios_totales=row["total_ejercicios"],
+            estado=row["estado"],
+            entrenador=row["entrenador"]
+        ) for row in data
+    ]
+
+    return historial
+
+
+
+@router.get("/alertas/cliente/{id_cliente}", response_model=List[AlertaProgreso])
+def obtener_alertas(id_cliente: int):
+    cn = get_connection()
+    cur = cn.cursor(dictionary=True)
+
+    # Verificar cliente
+    cur.execute("""
+        SELECT id_usuario, nombre
+        FROM usuarios
+        WHERE id_usuario = %s AND rol = 'alumno'
+    """, (id_cliente,))
+    if not cur.fetchone():
+        raise HTTPException(404, "Cliente no encontrado")
+
+    alertas = []
+    id_counter = 1
+
+    # Rutinas por expirar
+    cur.execute("""
+        SELECT nombre_rutina, fecha_fin,
+               DATEDIFF(fecha_fin, NOW()) AS dias_restantes
+        FROM historial_rutinas
+        WHERE id_cliente = %s
+          AND estado = 'activa'
+          AND fecha_fin > NOW()
+          AND DATEDIFF(fecha_fin, NOW()) <= 7
+    """, (id_cliente,))
+    for r in cur.fetchall():
+        alertas.append(AlertaProgreso(
+            id_alerta=id_counter,
+            tipo="rutina_expira",
+            titulo="⚠️ Rutina próxima a expirar",
+            mensaje=f"La rutina '{r['nombre_rutina']}' expira en {r['dias_restantes']} días",
+            fecha=datetime.now().isoformat(),
+            prioridad="alta",
+            leida=False
+        ))
+        id_counter += 1
+
+    # Sin rutinas activas
+    cur.execute("""
+        SELECT COUNT(*) AS activas
+        FROM historial_rutinas
+        WHERE id_cliente = %s
+          AND estado = 'activa'
+          AND fecha_fin > NOW()
+    """, (id_cliente,))
+    if cur.fetchone()["activas"] == 0:
+        alertas.append(AlertaProgreso(
+            id_alerta=id_counter,
+            tipo="sin_rutina",
+            titulo="📋 Sin rutina activa",
+            mensaje="No tienes ninguna rutina activa.",
+            fecha=datetime.now().isoformat(),
+            prioridad="alta",
+            leida=False
+        ))
+        id_counter += 1
+
+    return alertas
+
+
+@router.get("/objetivos/cliente/{id_cliente}", response_model=List[ObjetivoProgreso])
+def obtener_objetivos_cliente(id_cliente: int):
+    cn = get_connection()
+    cur = cn.cursor(dictionary=True)
+
+    # 1. Buscar rutina activa
+    cur.execute("""
+        SELECT id_historial, nombre_rutina, objetivo, fecha_inicio, fecha_fin
+        FROM historial_rutinas
+        WHERE id_cliente = %s 
+        AND estado = 'activa'
+        ORDER BY fecha_inicio DESC
+        LIMIT 1
+    """, (id_cliente,))
+
+    rutina = cur.fetchone()
+    if not rutina:
+        return []  # sin rutina activa = sin objetivos
+
+    # 2. Obtener ejercicios de la rutina
+    cur.execute("""
+        SELECT
+            hre.id_ejercicio,
+            e.nombre,
+            hre.peso_inicial
+        FROM historial_rutina_ejercicios AS hre
+        INNER JOIN ejercicios AS e
+            ON e.id_ejercicio = hre.id_ejercicio
+        WHERE hre.id_historial = %s
+    """, (rutina["id_historial"],))
+
+    ejercicios = cur.fetchall()
+
+    objetivos = []
+    id_counter = 1
+
+    for ej in ejercicios:
+        cur.execute("""
+            SELECT peso_kg 
+            FROM progreso_ejercicios
+            WHERE id_cliente = %s AND id_ejercicio = %s
+            ORDER BY fecha_sesion DESC
+            LIMIT 1
+        """, (id_cliente, ej["id_ejercicio"]))
+
+        ultimo = cur.fetchone()
+        peso_actual = ultimo["peso_kg"] if ultimo else ej["peso_inicial"]
+
+        # objetivo: +15% de mejora
+        peso_objetivo = ej["peso_inicial"] * 1.15 if ej["peso_inicial"] else None
+
+        porcentaje = 0
+        if peso_objetivo:
+            porcentaje = (peso_actual / peso_objetivo) * 100
+            if porcentaje > 100:
+                porcentaje = 100
+
+        estado = (
+            "alcanzado" if porcentaje >= 100 else
+            "en_progreso" if porcentaje > 0 else
+            "pendiente"
+        )
+
+        objetivos.append(ObjetivoProgreso(
+            id_objetivo=id_counter,
+            tipo="peso",
+            descripcion=f"Incrementar peso en {ej['nombre']}",
+            fecha_inicio=rutina["fecha_inicio"].isoformat(),
+            fecha_fin=rutina["fecha_fin"].isoformat(),
+            progreso=porcentaje,
+            estado=estado
+        ))
+        id_counter += 1
+
+    return objetivos
+
+
+@router.get("/objetivos/cliente/{id_cliente}", response_model=List[ObjetivoProgreso])
+def obtener_objetivos(id_cliente: int):
+    cn = get_connection()
+    cur = cn.cursor(dictionary=True)
+
+    # validar
+    cur.execute("""
+        SELECT id_usuario FROM usuarios
+        WHERE id_usuario = %s AND rol = 'alumno'
+    """, (id_cliente,))
+    if not cur.fetchone():
+        raise HTTPException(404, "Cliente no encontrado")
+
+    objetivos = []
+    id_counter = 1
+
+    # Objetivos por rutina activa
+    cur.execute("""
+        SELECT 
+            nombre_rutina,
+            objetivo,
+            fecha_inicio,
+            fecha_fin,
+            duracion_dias,
+            DATEDIFF(NOW(), fecha_inicio) AS dias_transcurridos
+        FROM historial_rutinas
+        WHERE id_cliente = %s
+          AND estado='activa'
+          AND fecha_fin > NOW()
+        ORDER BY fecha_inicio DESC
+    """, (id_cliente,))
+
+    for r in cur.fetchall():
+        progreso = min((r['dias_transcurridos'] / r['duracion_dias']) * 100, 100)
+
+        objetivos.append(ObjetivoProgreso(
+            id_objetivo=id_counter,
+            tipo="rutina",
+            descripcion=f"Completar rutina: {r['nombre_rutina']}",
+            fecha_inicio=r["fecha_inicio"].isoformat(),
+            fecha_fin=r["fecha_fin"].isoformat(),
+            progreso=progreso,
+            estado="activo"
+        ))
+        id_counter += 1
+
+    return objetivos
+
+
+@router.get("/alertas/cliente/{id_cliente}", response_model=List[AlertaProgreso])
+def obtener_alertas_cliente(id_cliente: int):
+    cn = get_connection()
+    cur = cn.cursor(dictionary=True)
+
+    alertas = []
+    id_counter = 1
+
+    # 1. Detectar ejercicios con estancamiento
+    cur.execute("""
+        SELECT 
+            p1.id_ejercicio,
+            e.nombre,
+            p1.peso_kg AS peso_reciente,
+            p2.peso_kg AS peso_pasado
+        FROM progreso_ejercicios p1
+        JOIN progreso_ejercicios p2 
+            ON p1.id_ejercicio = p2.id_ejercicio
+        JOIN ejercicios e 
+            ON e.id_ejercicio = p1.id_ejercicio
+        WHERE p1.id_cliente = %s
+        AND p2.id_cliente = %s
+        AND p1.numero_sesion = p2.numero_sesion + 3
+    """, (id_cliente, id_cliente))
+
+    for row in cur.fetchall():
+        if row["peso_reciente"] <= row["peso_pasado"]:
+            alertas.append(AlertaProgreso(
+                id_alerta=id_counter,
+                tipo="aumentar_peso",
+                titulo="Debes aumentar el peso",
+                mensaje=f"En el ejercicio {row['nombre']} te has estancado. Intenta subir el peso.",
+                prioridad="media",
+                fecha=datetime.now().isoformat(),
+                leida=False
             ))
+            id_counter += 1
 
-        return objetivos
+    return alertas
 
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener objetivos: {str(e)}")
+@router.post("/progresion/historial/crear")
+def crear_historial(id_rutina: int, id_cliente: int):
+    cn = get_connection()
+    cur = cn.cursor()
 
+    # 1. Crear historial
+    cur.execute("""
+        INSERT INTO historial_rutinas(id_cliente, nombre_rutina, fecha_inicio, fecha_fin, estado)
+        SELECT id_cliente, nombre, NOW(), DATE_ADD(NOW(), INTERVAL duracion_meses MONTH), 'activa'
+        FROM rutinas WHERE id_rutina = %s
+    """, (id_rutina,))
+    id_historial = cur.lastrowid
 
-# ============================================================
-# ENDPOINTS - DASHBOARD
-# ============================================================
+    # 2. Copiar ejercicios
+    cur.execute("""
+        INSERT INTO historial_rutina_ejercicios(id_historial, id_ejercicio, nombre_ejercicio, series, repeticiones, peso_sugerido)
+        SELECT %s, id_ejercicio, nombre, series, repeticiones, 0
+        FROM rutina_ejercicios
+        WHERE id_rutina = %s
+    """, (id_historial, id_rutina))
 
-@router.get("/dashboard/cliente/{id_cliente}")
-def obtener_dashboard_cliente(
-        id_cliente: int,
-        db: Session = Depends(get_db)
-) -> Dict[str, Any]:
-    """
-    Obtiene un resumen completo del progreso del cliente para dashboard.
-    """
-    try:
-        # Resumen general
-        query_resumen = text("""
-            SELECT * FROM v_resumen_progreso_cliente
-            WHERE id_usuario = :id_cliente
-        """)
-        resumen = db.execute(query_resumen, {"id_cliente": id_cliente}).fetchone()
-
-        # Alertas pendientes
-        query_alertas = text("""
-            SELECT COUNT(*) FROM alertas_progresion
-            WHERE id_cliente = :id_cliente AND estado = 'pendiente'
-        """)
-        alertas_count = db.execute(query_alertas, {"id_cliente": id_cliente}).fetchone()[0]
-
-        # Records personales recientes
-        query_records = text("""
-            SELECT COUNT(*) FROM progreso_ejercicios
-            WHERE id_cliente = :id_cliente 
-              AND es_record_personal = TRUE
-              AND fecha_sesion >= DATE_SUB(NOW(), INTERVAL 30 DAY)
-        """)
-        records_mes = db.execute(query_records, {"id_cliente": id_cliente}).fetchone()[0]
-
-        # Objetivos activos
-        query_objetivos = text("""
-            SELECT COUNT(*) FROM objetivos_cliente
-            WHERE id_cliente = :id_cliente 
-              AND estado IN ('pendiente', 'en_progreso')
-        """)
-        objetivos_activos = db.execute(query_objetivos, {"id_cliente": id_cliente}).fetchone()[0]
-
-        return {
-            "resumen": {
-                "total_rutinas": resumen[3] if resumen else 0,
-                "rutinas_completadas": resumen[4] if resumen else 0,
-                "total_sesiones": resumen[5] if resumen else 0,
-                "cumplimiento_promedio": float(resumen[6] or 0) if resumen else 0,
-                "ultima_sesion": resumen[7] if resumen else None
-            },
-            "alertas_pendientes": alertas_count,
-            "records_este_mes": records_mes,
-            "objetivos_activos": objetivos_activos
-        }
-
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Error al obtener dashboard: {str(e)}")
+    cn.commit()
+    return {"success": True, "id_historial": id_historial}

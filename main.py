@@ -1,4 +1,4 @@
-# main.py - VERSIÃ“N COMPLETA Y FUNCIONAL
+# main.py - VERSIÓN FINAL CON DEBUG
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -7,18 +7,26 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import insert, select
-from routers.cliente_entrenador import router as cliente_entrenador_router
+
 import os
-# Utilidades
-from utils.dependencies import get_db
-from models.user import Usuario
-from utils.passwords import verify_password, hash_password
+import datetime
+import jwt
 
-# Google OAuth
-from google.oauth2 import id_token
-from google.auth.transport.requests import Request as GRequest
+# ============================================================
+# IMPORTS DE ROUTERS CON MANEJO DE ERRORES
+# ============================================================
 
-# Imports de routers
+# Cliente-Entrenador
+from routers.cliente_entrenador import router as cliente_entrenador_router
+
+# Progresión
+from routers import progresion
+
+from routers.ia import router as ia_router
+IA_ROUTER_DISPONIBLE = True
+
+
+# Otros routers
 from routers import (
     usuarios_router,
     entrenadores_router,
@@ -28,21 +36,26 @@ from routers import (
     resenas_router,
     mensajes_router,
     pagos_router,
-    ia_router, cliente_entrenador,
+    cliente_entrenador
 )
 
-import os
-import datetime
-import jwt
+# Utilidades
+from utils.dependencies import get_db
+from utils.passwords import verify_password, hash_password
+from models.user import Usuario
+
+# Google OAuth
+from google.oauth2 import id_token
+from google.auth.transport.requests import Request as GRequest
 
 # ============================================================
-# CONFIGURACIÃ“N
+# CONFIGURACIÓN
 # ============================================================
 
 app = FastAPI(
     title="FitCoach API",
     version="1.0.0",
-    description="API para gestiÃ³n de entrenadores y clientes"
+    description="API para gestión de entrenadores y clientes"
 )
 
 # CORS
@@ -75,9 +88,8 @@ JWT_ALG = "HS256"
 JWT_EXP_DAYS = 7
 VALID_ROLES = {"alumno", "entrenador"}
 
-
 # ============================================================
-# FUNCIONES HELPER
+# FUNCIONES HELPER (sin cambios)
 # ============================================================
 
 def _role_str(obj) -> str:
@@ -93,7 +105,7 @@ def make_token(user: Usuario) -> str:
     now = datetime.datetime.utcnow()
     user_id = getattr(user, "id_usuario", None) or getattr(user, "id", None)
     if not user_id:
-        raise HTTPException(status_code=500, detail="Usuario sin ID vÃ¡lido")
+        raise HTTPException(status_code=500, detail="Usuario sin ID válido")
     provider = getattr(user, "auth_provider", None) or "local"
     payload = {
         "sub": str(user_id),
@@ -114,7 +126,7 @@ def _insert_user_core(db: Session, values: dict) -> Usuario:
     forbidden = {"imc"} | computed_cols
     clean = {k: v for k, v in values.items() if k in model_cols and v is not None and k not in forbidden}
     if not clean:
-        raise HTTPException(status_code=500, detail="No hay columnas vÃ¡lidas para insertar")
+        raise HTTPException(status_code=500, detail="No hay columnas válidas para insertar")
     res = db.execute(insert(Usuario.__table__).values(**clean))
     db.commit()
     new_id = getattr(res, "lastrowid", None) or getattr(res, "inserted_primary_key", [None])[0]
@@ -147,16 +159,16 @@ def _coerce_role_value(raw: str | None):
         for m in enum_cls:
             if str(m.value).lower() == norm or m.name.lower() == norm:
                 return m
-        raise HTTPException(status_code=422, detail="Rol invÃ¡lido. Usa 'alumno' o 'entrenador'.")
+        raise HTTPException(status_code=422, detail="Rol inválido. Usa 'alumno' o 'entrenador'.")
     enums = getattr(t, "enums", None)
     if enums:
         if norm is None:
             raise HTTPException(status_code=422, detail="Debes seleccionar un rol.")
         if norm in enums or any(e.lower() == norm for e in enums):
             return next((e for e in enums if e.lower() == norm), norm)
-        raise HTTPException(status_code=422, detail=f"Rol invÃ¡lido. Permitidos: {', '.join(enums)}.")
+        raise HTTPException(status_code=422, detail=f"Rol inválido. Permitidos: {', '.join(enums)}.")
     if norm not in VALID_ROLES:
-        raise HTTPException(status_code=422, detail="Rol invÃ¡lido. Usa 'alumno' o 'entrenador'.")
+        raise HTTPException(status_code=422, detail="Rol inválido. Usa 'alumno' o 'entrenador'.")
     return norm
 
 
@@ -187,17 +199,17 @@ class GoogleCred(BaseModel):
 
 
 # ============================================================
-# LÃ“GICA DE AUTENTICACIÃ“N
+# LÓGICA DE AUTENTICACIÓN
 # ============================================================
 
 def _password_login_logic(payload: LoginCred, db: Session) -> dict:
-    """LÃ³gica de login con email/password"""
+    """Lógica de login con email/password"""
     email = payload.email.strip().lower()
     user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.email == email).first()
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado.")
     if _is_google_only(user):
-        raise HTTPException(status_code=400, detail="Esta cuenta estÃ¡ vinculada a Google. Usa 'Continuar con Google'.")
+        raise HTTPException(status_code=400, detail="Esta cuenta está vinculada a Google. Usa 'Continuar con Google'.")
 
     db_pwd = getattr(user, "password", "") or ""
     if isinstance(db_pwd, (bytes, bytearray)):
@@ -211,7 +223,7 @@ def _password_login_logic(payload: LoginCred, db: Session) -> dict:
         db.commit()
         ok = True
     if not ok:
-        raise HTTPException(status_code=401, detail="ContraseÃ±a incorrecta.")
+        raise HTTPException(status_code=401, detail="Contraseña incorrecta.")
 
     if not getattr(user, "auth_provider", None):
         try:
@@ -241,12 +253,12 @@ def _current_user(db: Session = Depends(get_db), Authorization: str | None = Hea
     try:
         payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
     except Exception:
-        raise HTTPException(status_code=401, detail="Token invÃ¡lido")
+        raise HTTPException(status_code=401, detail="Token inválido")
     user_id = payload.get("sub")
     try:
         user_id = int(user_id)
     except Exception:
-        raise HTTPException(status_code=401, detail="Token invÃ¡lido (sub)")
+        raise HTTPException(status_code=401, detail="Token inválido (sub)")
     user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.id_usuario == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
@@ -254,7 +266,7 @@ def _current_user(db: Session = Depends(get_db), Authorization: str | None = Hea
 
 
 # ============================================================
-# RUTAS DE AUTENTICACIÃ“N
+# RUTAS DE AUTENTICACIÓN
 # ============================================================
 
 from fastapi import APIRouter
@@ -264,7 +276,7 @@ auth_router = APIRouter(prefix="/auth", tags=["Auth"])
 
 @auth_router.post("/login")
 def auth_login(payload: LoginCred, db: Session = Depends(get_db)):
-    """Login con email y contraseÃ±a"""
+    """Login con email y contraseña"""
     return _password_login_logic(payload, db)
 
 
@@ -274,12 +286,12 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
     try:
         info = id_token.verify_oauth2_token(payload.credential, GRequest(), CLIENT_ID)
     except Exception:
-        raise HTTPException(status_code=401, detail="Token de Google invÃ¡lido")
+        raise HTTPException(status_code=401, detail="Token de Google inválido")
 
     sub = info.get("sub")
     email = info.get("email")
     if not email:
-        raise HTTPException(status_code=422, detail="Google no devolviÃ³ email")
+        raise HTTPException(status_code=422, detail="Google no devolvió email")
 
     given = (info.get("given_name") or "").strip()
     family = (info.get("family_name") or "").strip()
@@ -331,7 +343,7 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
         else:
             role_value = _coerce_role_value(payload.rol) if has("rol") else None
             if has("rol") and role_value is None:
-                raise HTTPException(status_code=422, detail="Debes seleccionar un rol vÃ¡lido.")
+                raise HTTPException(status_code=422, detail="Debes seleccionar un rol válido.")
             values = {
                 "email": email,
                 "rol": role_value if has("rol") else None,
@@ -354,7 +366,7 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
             user = _insert_user_core(db, values)
     except IntegrityError:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Conflicto de claves Ãºnicas.")
+        raise HTTPException(status_code=409, detail="Conflicto de claves únicas.")
     except HTTPException:
         db.rollback()
         raise
@@ -375,52 +387,91 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
 
 
 # ============================================================
-# INCLUIR ROUTERS
+# INCLUIR ROUTERS - ORDEN CORRECTO
 # ============================================================
 
-# Auth
+print("\n" + "="*50)
+print("🚀 INICIANDO INCLUSIÓN DE ROUTERS...")
+print("="*50)
+
+# 1. Auth
 app.include_router(auth_router)
+print("✅ Auth router incluido")
 
-# Usuarios
+# 2. Usuarios
 app.include_router(usuarios_router, tags=["Usuarios"])
+print("✅ Usuarios router incluido")
 
-# Entrenadores (IMPORTANTE - incluir explÃ­citamente)
+# 3. Entrenadores
 app.include_router(entrenadores_router, tags=["Entrenadores"])
+print("✅ Entrenadores router incluido")
 
-# Ejercicios
+# 4. Ejercicios
 app.include_router(ejercicios_router, prefix="/api/ejercicios", tags=["Ejercicios"])
+print("✅ Ejercicios router incluido")
 
-# Rutinas
+# 5. Rutinas
 app.include_router(rutinas_router, prefix="/api/rutinas", tags=["Rutinas"])
+print("✅ Rutinas router incluido")
 
-# Asignaciones
+# 6. Asignaciones
 app.include_router(asignaciones_router, prefix="/api/asignaciones", tags=["Asignaciones"])
+print("✅ Asignaciones router incluido")
 
-# ReseÃ±as
-app.include_router(resenas_router, tags=["ReseÃ±as"])
+# 7. Reseñas
+app.include_router(resenas_router, tags=["Reseñas"])
+print("✅ Reseñas router incluido")
 
-# Mensajes
+# 8. Mensajes
 app.include_router(mensajes_router, tags=["Mensajes"])
+print("✅ Mensajes router incluido")
 
-# Pagos
+# 9. Pagos
 app.include_router(pagos_router, tags=["Pagos"])
+print("✅ Pagos router incluido")
 
-# IA con Gemini
-app.include_router(ia_router, tags=["IA"])
+# 10. Cliente-Entrenador
 app.include_router(cliente_entrenador.router, prefix="/api")
 app.include_router(cliente_entrenador_router, tags=["Cliente-Entrenador"])
+print("✅ Cliente-Entrenador routers incluidos")
+
 # ============================================================
-# RUTAS BÃSICAS
+# 🔴 ROUTER IA (CORRECTO)
+# ============================================================
+if IA_ROUTER_DISPONIBLE and ia_router:
+    app.include_router(ia_router, prefix="/api/ia", tags=["IA"])
+
+    print("✅ IA router incluido")
+else:
+    print("⚠️ IA router NO incluido - verifica routers/ia.py")
+
+# ============================================================
+# 🔴 ROUTER PROGRESIÓN
+# ============================================================
+app.include_router(
+    progresion.router,
+    prefix="/progresion",
+    tags=["Progresión"]
+)
+print("✅ Progresión router incluido")
+
+print("="*50)
+print("✅ TODOS LOS ROUTERS INCLUIDOS")
+print("="*50 + "\n")
+
+# ============================================================
+# RUTAS BÁSICAS
 # ============================================================
 
 @app.get("/")
 def read_root():
-    """Ruta raÃ­z de la API"""
+    """Ruta raíz de la API"""
     return {
         "nombre": "FitCoach API",
         "version": "1.0.0",
         "documentacion": "/docs",
-        "redoc": "/redoc"
+        "redoc": "/redoc",
+        "ia_router_disponible": IA_ROUTER_DISPONIBLE
     }
 
 
@@ -430,11 +481,27 @@ def health_check():
     return {"status": "ok"}
 
 
+@app.get("/debug/routes")
+def debug_routes():
+    """Muestra todas las rutas registradas"""
+    routes = []
+    for route in app.routes:
+        if hasattr(route, "methods"):
+            routes.append({
+                "path": route.path,
+                "methods": list(route.methods),
+                "name": route.name
+            })
+    return {"total": len(routes), "routes": routes}
+
+
 # ============================================================
-# EJECUCIÃ“N
+# EJECUCIÓN
 # ============================================================
 
 if __name__ == "__main__":
     import uvicorn
-
+    print("\n🚀 Iniciando servidor FitCoach API...")
+    print("📝 Documentación disponible en: http://127.0.0.1:8000/docs")
+    print("🔍 Debug de rutas en: http://127.0.0.1:8000/debug/routes\n")
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

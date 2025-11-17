@@ -517,24 +517,64 @@ else:
 
     def guardar_ejercicios_rutina(db, id_rutina, dias):
         """
-        Guarda los ejercicios de todos los días de la rutina
-        en la tabla 'rutina_ejercicios'
+        Guarda los ejercicios generados por IA en la BD.
+        Si un ejercicio NO existe en la tabla `ejercicios`,
+        lo crea automáticamente.
         """
+
         for dia in dias:
             for ej in dia.ejercicios:
+
+                # Buscar si el ejercicio ya existe (por nombre)
+                row = db.execute(text("""
+                    SELECT id_ejercicio 
+                    FROM ejercicios 
+                    WHERE LOWER(nombre) = LOWER(:nombre)
+                    LIMIT 1
+                """), {
+                    "nombre": ej.nombre.strip()
+                }).fetchone()
+
+                # SI NO EXISTE → CREARLO
+                if not row:
+                    db.execute(text("""
+                        INSERT INTO ejercicios (
+                            nombre, descripcion, grupo_muscular, 
+                            dificultad, tipo
+                        )
+                        VALUES (:n, :d, :g, :dif, :t)
+                    """), {
+                        "n": ej.nombre,
+                        "d": ej.descripcion or "",
+                        "g": ej.grupo_muscular or "GENERAL",
+                        "dif": ej.dificultad or "intermedio",
+                        "t": ej.tipo or "general"
+                    })
+
+                    # Recuperar el ID recién creado
+                    new_id = db.execute(text("SELECT LAST_INSERT_ID()")).scalar()
+                    ej_id = new_id
+
+                    print(f"✨ Ejercicio creado automáticamente: {ej.nombre} (ID {ej_id})")
+
+                else:
+                    ej_id = row[0]
+
+                # Insertar en rutina_ejercicios
                 db.execute(text("""
-                    INSERT INTO rutina_ejercicios (
-                        id_rutina, id_ejercicio, series,
+                    INSERT INTO rutina_ejercicios(
+                        id_rutina, id_ejercicio, series, 
                         repeticiones, descanso_segundos
                     )
-                    VALUES (:rutina, :ejercicio, :series, :reps, :descanso)
+                    VALUES (:rutina, :ej, :s, :r, :d)
                 """), {
                     "rutina": id_rutina,
-                    "ejercicio": ej.id_ejercicio,
-                    "series": ej.series,
-                    "reps": ej.repeticiones,
-                    "descanso": ej.descanso_segundos
+                    "ej": ej_id,
+                    "s": ej.series,
+                    "r": ej.repeticiones,
+                    "d": ej.descanso_segundos
                 })
+
         db.commit()
 
 

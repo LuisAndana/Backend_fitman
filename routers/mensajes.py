@@ -477,3 +477,23 @@ def obtener_estadisticas_mensajes(
             for d in top_destinatarios
         ]
     }
+
+@router.get("/mis-conversaciones-entrenador/lista", response_model=List[ConversacionOut])
+def obtener_conversaciones_entrenador_endpoint(
+        user_id: int = Query(..., description="ID del entrenador"),
+        db: Session = Depends(get_db),
+):
+    """
+    🔧 NUEVO ENDPOINT:
+    Obtiene las conversaciones de un ENTRENADOR.
+
+
+    """
+
+    # Validar que el usuario existe
+    usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+
+    conversaciones = obtener_conversaciones(db, user_id)
+    return conversaciones

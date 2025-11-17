@@ -1,8 +1,9 @@
-# main.py - VERSIÓN FINAL CON DEBUG
+# main.py - VERSIÓN CORREGIDA
 
 from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from fastapi.responses import FileResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session, defer
 from sqlalchemy.exc import IntegrityError
@@ -11,6 +12,7 @@ from sqlalchemy import insert, select
 import os
 import datetime
 import jwt
+from pathlib import Path
 
 # ============================================================
 # IMPORTS DE ROUTERS CON MANEJO DE ERRORES
@@ -22,9 +24,17 @@ from routers.cliente_entrenador import router as cliente_entrenador_router
 # Progresión
 from routers import progresion
 
-from routers.ia import router as ia_router
-IA_ROUTER_DISPONIBLE = True
 
+# IA Router - con manejo de errores
+try:
+    from routers.ia import router as ia_router
+
+    IA_ROUTER_DISPONIBLE = True
+    print("✅ Router IA importado correctamente")
+except ImportError as e:
+    print(f"⚠️ No se pudo importar router IA: {e}")
+    ia_router = None
+    IA_ROUTER_DISPONIBLE = False
 
 # Otros routers
 from routers import (
@@ -78,6 +88,9 @@ app.add_middleware(
 os.makedirs("uploads", exist_ok=True)
 app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
 
+# Crear carpeta static si no existe
+os.makedirs("static", exist_ok=True)
+
 # ============================================================
 # CONSTANTES
 # ============================================================
@@ -87,6 +100,7 @@ JWT_SECRET = os.getenv("JWT_SECRET", "cambia-esto-en-produccion")
 JWT_ALG = "HS256"
 JWT_EXP_DAYS = 7
 VALID_ROLES = {"alumno", "entrenador"}
+
 
 # ============================================================
 # FUNCIONES HELPER (sin cambios)
@@ -184,6 +198,26 @@ def _is_google_only(user: Usuario) -> bool:
     return (provider == "google") or has_sub or is_placeholder
 
 
+def _current_user(db: Session = Depends(get_db), Authorization: str | None = Header(None)) -> Usuario:
+    """Extrae el usuario actual del token JWT"""
+    if not Authorization or not Authorization.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Falta header Authorization Bearer")
+    token = Authorization.split(" ", 1)[1].strip()
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token inválido")
+    user_id = payload.get("sub")
+    try:
+        user_id = int(user_id)
+    except Exception:
+        raise HTTPException(status_code=401, detail="Token inválido (sub)")
+    user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.id_usuario == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return user
+
+
 # ============================================================
 # SCHEMAS
 # ============================================================
@@ -199,8 +233,19 @@ class GoogleCred(BaseModel):
 
 
 # ============================================================
-# LÓGICA DE AUTENTICACIÓN
+# RUTAS DE AUTENTICACIÓN
 # ============================================================
+
+from fastapi import APIRouter
+
+auth_router = APIRouter(prefix="/auth", tags=["Auth"])
+
+
+@auth_router.post("/login")
+def auth_login(payload: LoginCred, db: Session = Depends(get_db)):
+    """Login con email y contraseña"""
+    return _password_login_logic(payload, db)
+
 
 def _password_login_logic(payload: LoginCred, db: Session) -> dict:
     """Lógica de login con email/password"""
@@ -243,41 +288,6 @@ def _password_login_logic(payload: LoginCred, db: Session) -> dict:
         "auth_provider": getattr(user, "auth_provider", "local"),
     }
     return {"ok": True, "token": token, "usuario": resp_usuario}
-
-
-def _current_user(db: Session = Depends(get_db), Authorization: str | None = Header(None)) -> Usuario:
-    """Extrae el usuario actual del token JWT"""
-    if not Authorization or not Authorization.lower().startswith("bearer "):
-        raise HTTPException(status_code=401, detail="Falta header Authorization Bearer")
-    token = Authorization.split(" ", 1)[1].strip()
-    try:
-        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALG])
-    except Exception:
-        raise HTTPException(status_code=401, detail="Token inválido")
-    user_id = payload.get("sub")
-    try:
-        user_id = int(user_id)
-    except Exception:
-        raise HTTPException(status_code=401, detail="Token inválido (sub)")
-    user = db.query(Usuario).options(defer(Usuario.sexo)).filter(Usuario.id_usuario == user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-    return user
-
-
-# ============================================================
-# RUTAS DE AUTENTICACIÓN
-# ============================================================
-
-from fastapi import APIRouter
-
-auth_router = APIRouter(prefix="/auth", tags=["Auth"])
-
-
-@auth_router.post("/login")
-def auth_login(payload: LoginCred, db: Session = Depends(get_db)):
-    """Login con email y contraseña"""
-    return _password_login_logic(payload, db)
 
 
 @auth_router.post("/google_signin")
@@ -387,81 +397,91 @@ def google_signin(payload: GoogleCred, db: Session = Depends(get_db)):
 
 
 # ============================================================
+# MANEJO DEL FAVICON
+# ============================================================
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    return FileResponse("static/favicon.ico") if Path("static/favicon.ico").exists() else {}
+
+
+
+# ============================================================
 # INCLUIR ROUTERS - ORDEN CORRECTO
 # ============================================================
 
-print("\n" + "="*50)
-print("🚀 INICIANDO INCLUSIÓN DE ROUTERS...")
-print("="*50)
+print("\n" + "=" * 60)
+print("🚀 Registrando routers...")
+print("=" * 60)
+
+# Montar archivos estáticos
+try:
+    app.mount("/static", StaticFiles(directory="static"), name="static")
+except Exception as e:
+    print(f"⚠️ No se pudo montar /static: {e}")
 
 # 1. Auth
 app.include_router(auth_router)
-print("✅ Auth router incluido")
+print("✔ Auth")
 
 # 2. Usuarios
 app.include_router(usuarios_router, tags=["Usuarios"])
-print("✅ Usuarios router incluido")
+print("✔ Usuarios")
 
 # 3. Entrenadores
 app.include_router(entrenadores_router, tags=["Entrenadores"])
-print("✅ Entrenadores router incluido")
+print("✔ Entrenadores")
 
 # 4. Ejercicios
 app.include_router(ejercicios_router, prefix="/api/ejercicios", tags=["Ejercicios"])
-print("✅ Ejercicios router incluido")
+print("✔ Ejercicios")
 
 # 5. Rutinas
 app.include_router(rutinas_router, prefix="/api/rutinas", tags=["Rutinas"])
-print("✅ Rutinas router incluido")
+print("✔ Rutinas")
 
 # 6. Asignaciones
 app.include_router(asignaciones_router, prefix="/api/asignaciones", tags=["Asignaciones"])
-print("✅ Asignaciones router incluido")
+print("✔ Asignaciones")
 
 # 7. Reseñas
 app.include_router(resenas_router, tags=["Reseñas"])
-print("✅ Reseñas router incluido")
+print("✔ Reseñas")
 
 # 8. Mensajes
 app.include_router(mensajes_router, tags=["Mensajes"])
-print("✅ Mensajes router incluido")
+print("✔ Mensajes")
 
 # 9. Pagos
 app.include_router(pagos_router, tags=["Pagos"])
-print("✅ Pagos router incluido")
+print("✔ Pagos")
 
 # 10. Cliente-Entrenador
 app.include_router(cliente_entrenador.router, prefix="/api")
 app.include_router(cliente_entrenador_router, tags=["Cliente-Entrenador"])
-print("✅ Cliente-Entrenador routers incluidos")
+print("✔ Cliente-Entrenador")
 
-# ============================================================
-# 🔴 ROUTER IA (CORRECTO)
-# ============================================================
-if IA_ROUTER_DISPONIBLE and ia_router:
-    app.include_router(ia_router, prefix="/api/ia", tags=["IA"])
+# 11. IA Router
+app.include_router(ia_router, prefix="/api/ia", tags=["IA"])
 
-    print("✅ IA router incluido")
-else:
-    print("⚠️ IA router NO incluido - verifica routers/ia.py")
 
-# ============================================================
-# 🔴 ROUTER PROGRESIÓN
-# ============================================================
+# 12. Progresión
 app.include_router(
     progresion.router,
     prefix="/progresion",
     tags=["Progresión"]
 )
-print("✅ Progresión router incluido")
+print("✔ Progresión")
 
-print("="*50)
-print("✅ TODOS LOS ROUTERS INCLUIDOS")
-print("="*50 + "\n")
+print("=" * 60)
+print("✔ Todos los routers registrados correctamente")
+print("=" * 60 + "\n")
+
 
 # ============================================================
 # RUTAS BÁSICAS
 # ============================================================
+
 
 @app.get("/")
 def read_root():
@@ -478,21 +498,50 @@ def read_root():
 @app.get("/health")
 def health_check():
     """Health check endpoint"""
-    return {"status": "ok"}
+    return {"status": "ok", "timestamp": datetime.datetime.utcnow().isoformat()}
 
 
 @app.get("/debug/routes")
 def debug_routes():
-    """Muestra todas las rutas registradas"""
+    """Muestra todas las rutas registradas con detalles"""
     routes = []
     for route in app.routes:
         if hasattr(route, "methods"):
             routes.append({
                 "path": route.path,
                 "methods": list(route.methods),
-                "name": route.name
+                "name": route.name,
+                "endpoint": route.endpoint.__name__ if hasattr(route, "endpoint") else None
             })
-    return {"total": len(routes), "routes": routes}
+
+    # Agrupar por prefijo
+    ia_routes = [r for r in routes if "/api/ia" in r["path"]]
+
+    return {
+        "total": len(routes),
+        "routes": routes,
+        "ia_routes": ia_routes,
+        "ia_router_status": "ACTIVE" if IA_ROUTER_DISPONIBLE else "INACTIVE"
+    }
+
+
+@app.get("/debug/ia-status")
+def debug_ia_status():
+    """Verifica el estado del router IA"""
+    ia_routes = []
+    for route in app.routes:
+        if hasattr(route, "methods") and "/api/ia" in route.path:
+            ia_routes.append({
+                "path": route.path,
+                "methods": list(route.methods),
+                "name": getattr(route, "name", "Unknown")
+            })
+
+    return {
+        "ia_router_imported": IA_ROUTER_DISPONIBLE,
+        "ia_routes_count": len(ia_routes),
+        "ia_routes": ia_routes
+    }
 
 
 # ============================================================
@@ -501,7 +550,9 @@ def debug_routes():
 
 if __name__ == "__main__":
     import uvicorn
+
     print("\n🚀 Iniciando servidor FitCoach API...")
     print("📝 Documentación disponible en: http://127.0.0.1:8000/docs")
-    print("🔍 Debug de rutas en: http://127.0.0.1:8000/debug/routes\n")
+    print("🔍 Debug de rutas en: http://127.0.0.1:8000/debug/routes")
+    print("🤖 Estado IA en: http://127.0.0.1:8000/debug/ia-status\n")
     uvicorn.run("main:app", host="127.0.0.1", port=8000, reload=True)

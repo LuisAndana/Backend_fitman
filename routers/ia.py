@@ -16,61 +16,90 @@ from utils.dependencies import get_db
 # ============================================================
 # ROUTER CON PREFIJO INTERNO - NO AÑADIR PREFIJO EN main.py
 # ============================================================
-router = APIRouter(prefix="/api/ia", tags=["IA"])
+router = APIRouter(tags=["IA"])
+
 
 # ============================================================
 # CONFIG - VERSIÓN ACTUALIZADA
 # ============================================================
 
-# Gemini Configuratio
+# Gemini Configuración
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 GEMINI_MODEL = os.getenv("GEMINI_MODEL", "models/gemini-2.5-flash")
 GEMINI_MODEL_ID = os.getenv("GEMINI_MODEL_ID", "models/gemini-2.5-flash")
 GEMINI_VISION_MODEL_ID = os.getenv("GEMINI_VISION_MODEL_ID", "models/gemini-2.5-pro")
-GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "120000"))  # 120 segundos por defecto
-GEMINI_TIMEOUT_SECONDS = GEMINI_TIMEOUT_MS / 1000  # Convertir a segundos
+GEMINI_TIMEOUT_MS = int(os.getenv("GEMINI_TIMEOUT_MS", "120000"))
+GEMINI_TIMEOUT_SECONDS = GEMINI_TIMEOUT_MS / 1000
 
+# =============================
+# ✨ SOLO HACER ESTO
+# =============================
 if GEMINI_API_KEY:
-        genai.configure(api_key=GEMINI_API_KEY)
-        print(f"✅ Gemini configurado con modelo: {GEMINI_MODEL}")
-        print(f"📊 Timeout configurado: {GEMINI_TIMEOUT_SECONDS} segundos")
+    genai.configure(api_key=GEMINI_API_KEY)
+    print(f"✅ Gemini configurado con modelo: {GEMINI_MODEL}")
+    print(f"📊 Timeout configurado: {GEMINI_TIMEOUT_SECONDS} segundos")
 else:
-    print("⚠️ GEMINI_API_KEY no configurada - usando solo generador local")
+    print("⚠️ GEMINI_API_KEY no configurada — modo fallback local+openai+grok habilitado")
 
-    # OpenAI Configuration
-    OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-    OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+# OpenAI siempre se configura fuera del else
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
-    # Import OpenAI only if API key is configured
-    if OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
+try:
+    from openai import OpenAI
+    openai_client = OpenAI(api_key=OPENAI_API_KEY) if OPENAI_API_KEY else None
+except ImportError:
+    openai_client = None
 
-            openai_client = OpenAI(api_key=OPENAI_API_KEY)
-        except ImportError:
-            print("⚠️ Advertencia: openai library no instalada. Instala con: pip install openai")
-            openai_client = None
-    else:
+# Grok siempre fuera del else
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-beta")
+
+try:
+    from openai import OpenAI
+    grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1") if GROK_API_KEY else None
+except ImportError:
+    grok_client = None
+
+
+# =============================
+# OpenAI Configuration (SIEMPRE se carga si hay key)
+# =============================
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+if OPENAI_API_KEY:
+    try:
+        from openai import OpenAI
+        openai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except ImportError:
+        print("⚠️ Advertencia: instala: pip install openai")
         openai_client = None
+else:
+    openai_client = None
 
-    # Grok (xAI) Configuration
-    GROK_API_KEY = os.getenv("GROK_API_KEY")
-    GROK_MODEL = os.getenv("GROK_MODEL", "grok-beta")
+# =============================
+# Grok Configuration
+# =============================
+GROK_API_KEY = os.getenv("GROK_API_KEY")
+GROK_MODEL = os.getenv("GROK_MODEL", "grok-beta")
 
-    # Import Grok client (uses OpenAI-compatible API)
-    if GROK_API_KEY:
-        try:
-            from openai import OpenAI
-
-            grok_client = OpenAI(
-                api_key=GROK_API_KEY,
-                base_url="https://api.x.ai/v1"
-            )
-        except ImportError:
-            print("⚠️ Advertencia: openai library no instalada para Grok. Instala con: pip install openai")
-            grok_client = None
-    else:
+if GROK_API_KEY:
+    try:
+        from openai import OpenAI
+        grok_client = OpenAI(api_key=GROK_API_KEY, base_url="https://api.x.ai/v1")
+    except ImportError:
+        print("⚠️ Advertencia: instala: pip install openai")
         grok_client = None
+else:
+    grok_client = None
+
+# =============================
+# ⛔️ IMPORTANTE:
+# A PARTIR DE AQUÍ SIGUE TODO TU CÓDIGO NORMAL
+# (schemas, clases, funciones, endpoints…)
+# FUERA DEL else:
+# =============================
 
     # ============================================================
     # SCHEMAS
@@ -915,49 +944,30 @@ else:
 
     def _build_ai_prompt(perfil: Optional[PerfilSalud], dias: int, nivel: str, objetivos: str) -> str:
         p = perfil or PerfilSalud()
-        pref = p.preferencias
-        home = (pref.lugar or "").lower() == "casa"
-        no_equipo = not pref.equipamiento
 
-        requisitos = [f"Nivel: {nivel}", f"Objetivo: {objetivos}", f"{dias} días/semana"]
+        return f"""
+    Eres un generador de rutinas de ejercicio. 
+    Responde ÚNICAMENTE con JSON válido y compatible con Pydantic. 
+    NO incluyas explicación, texto fuera del JSON, ni markdown.
 
-        if home and no_equipo:
-            requisitos.append("Casa sin equipo (peso corporal/bandas)")
-        elif home and pref.equipamiento:
-            requisitos.append(f"Equipo: {', '.join(pref.equipamiento[:3])}")
+    El JSON DEBE tener esta estructura EXACTA:
 
-        perfil_items = []
-        if p.datos.edad:
-            perfil_items.append(f"Edad: {p.datos.edad}")
-        if p.condiciones:
-            perfil_items.append(f"Condiciones: {', '.join([c.nombre for c in p.condiciones[:2]])}")
-        if p.lesiones:
-            perfil_items.append(f"Lesiones: {', '.join([l.zona for l in p.lesiones[:2]])}")
-
-        perfil_text = ". ".join(perfil_items) if perfil_items else "Sin restricciones"
-
-        return f"""Crea rutina de {dias} días en JSON.
-    
-    Requisitos: {' | '.join(requisitos)}
-    Usuario: {perfil_text}
-    
-    JSON (5-6 ejercicios/día):
     {{
-      "nombre": "Rutina {nivel} {dias}d",
-      "descripcion": "Enfoque {objetivos}",
+      "nombre": "string",
+      "descripcion": "string",
       "dias_semana": {dias},
-      "minutos_aproximados": {pref.tiempo_minutos or 45},
+      "minutos_aproximados": 60,
       "dias": [
         {{
           "numero_dia": 1,
           "nombre_dia": "Lunes",
-          "descripcion": "Push",
-          "grupos_enfoque": ["PECHO","HOMBROS"],
+          "descripcion": "string",
+          "grupos_enfoque": ["PECHO","ESPALDA"],
           "ejercicios": [
             {{
-              "id_ejercicio": 0,
+              "id_ejercicio": 1,
               "nombre": "Press banca",
-              "descripcion": "Pecho completo",
+              "descripcion": "string",
               "grupo_muscular": "PECHO",
               "dificultad": "{nivel}",
               "tipo": "fuerza",
@@ -970,9 +980,14 @@ else:
         }}
       ]
     }}
-    
-    IMPORTANTE: series, repeticiones y descanso_segundos deben ser NÚMEROS ENTEROS (ej: 10, NO "10-15").
-    SOLO JSON válido. Sin texto extra."""
+
+    Requisitos del usuario:
+    - Objetivo: {objetivos}
+    - Nivel: {nivel}
+    - Días por semana: {dias}
+    - Evita texto adicional.
+    - Asegura que "dias" tenga exactamente {dias} elementos.
+    """
 
 
     # ============================================================
@@ -1060,22 +1075,10 @@ else:
         }
 
         safety_settings = [
-            {
-                "category": "HARM_CATEGORY_HARASSMENT",
-                "threshold": "BLOCK_NONE"
-            },
-            {
-                "category": "HARM_CATEGORY_HATE_SPEECH",
-                "threshold": "BLOCK_NONE"
-            },
-            {
-                "category": "HARM_CATEGORY_SEXUALLY_EXPLICIT",
-                "threshold": "BLOCK_NONE"
-            },
-            {
-                "category": "HARM_CATEGORY_DANGEROUS_CONTENT",
-                "threshold": "BLOCK_ONLY_HIGH"
-            }
+            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
+            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_ONLY_HIGH"}
         ]
 
         request_options = {
@@ -1085,6 +1088,9 @@ else:
         last_err = None
         tried_models = []
 
+        # ===============================================================
+        # 🔵 PRIMER INTENTO CON MODELO PRINCIPAL
+        # ===============================================================
         try:
             selected_model = _normalize_model_name(GEMINI_MODEL)
             tried_models.append(selected_model)
@@ -1115,49 +1121,56 @@ else:
                     except TypeError:
                         resp = model.generate_content([prompt], generation_config=generation_config)
 
+            # ===============================================================
+            # 🔥 LOG EXTENDIDO DEL RAW GEMINI OUTPUT
+            # ===============================================================
+            print("\n\n======================= GEMINI RAW RESPONSE =======================")
+            print(resp)
+            print("======================= END RAW RESPONSE ==========================\n")
+
             raw = _resp_to_text(resp)
-            if not raw:
+
+            print("\n========= RAW TEXT EXTRACTED FROM RESPONSE =========")
+            print(raw)
+            print("====================================================\n")
+
+            if not raw or raw.strip() == "":
                 pf = getattr(resp, "prompt_feedback", None)
                 raise RuntimeError(f"Gemini devolvió vacío. prompt_feedback={pf}")
 
+            # Intentar parsear JSON
             try:
                 return json.loads(raw)
             except Exception:
+                # Buscar JSON dentro del texto
                 m = re.search(r"\{[\s\S]*\}", raw)
                 if not m:
-                    raise ValueError(f"Gemini no devolvió JSON válido. raw (400): {raw[:400]}...")
+                    raise ValueError(
+                        f"Gemini no devolvió JSON válido. Primeros 400 chars:\n{raw[:400]}..."
+                    )
                 return json.loads(m.group(0))
 
-
         except Exception as e:
-
             print("🔴 GEMINI ERROR DETECTADO 🔴")
-
             print("Tipo:", type(e).__name__)
-
             print("Mensaje:", str(e))
 
-            # Log de respuesta cruda
-
             try:
-
-                print("Raw Response:", resp)
-
+                print("RAW resp:", resp)
             except Exception:
-
                 print("❌ No hay RAW response")
 
             last_err = e
 
             if not _is_quota_error(e):
                 raise RuntimeError(
-
                     f"Fallo en _gemini_generate_plan: {type(e).__name__}: {str(e)} "
-    
                     f"(modelos probados: {tried_models})"
-
                 )
 
+        # ===============================================================
+        # 🔵 SEGUNDO INTENTO — FALLBACK MODEL
+        # ===============================================================
         try:
             light_model = FALLBACK_LIGHT_MODEL
             tried_models.append(light_model)
@@ -1187,6 +1200,11 @@ else:
                         )
                     except TypeError:
                         resp = model.generate_content([prompt], generation_config=generation_config)
+
+            # LOG del fallback
+            print("\n=== FALLBACK GEMINI RAW ===")
+            print(resp)
+            print("=== END FALLBACK RAW ===\n")
 
             raw = _resp_to_text(resp)
             if not raw:
@@ -1433,45 +1451,52 @@ else:
 
     @router.post("/generar-rutina", response_model=Dict[str, Any])
     def generar_rutina_distribuida(
-
-        solicitud: SolicitudGenerarRutina,
-        db: Session = Depends(get_db),
-        activar_vigencia: bool = Query(False, description="Activar vigencia inmediatamente")
+            solicitud: SolicitudGenerarRutina,
+            db: Session = Depends(get_db),
+            activar_vigencia: bool = Query(False, description="Activar vigencia inmediatamente")
     ):
-        """
-        Genera rutina con IA, la guarda en BD, crea historial,
-        copia ejercicios y crea objetivos + alertas.
-        """
         dias = []
         seguridad = None
-        generada_por = "local"  # fallback seguro
+        generada_por = "local"
         descripcion = "Rutina generada localmente"
+
         try:
-            # VALIDACIONES BÁSICAS
+            # VALIDACIONES
             if not (2 <= solicitud.dias <= 7):
                 raise HTTPException(status_code=422, detail="Días debe estar entre 2 y 7")
 
             if not (1 <= solicitud.duracion_meses <= 12):
                 raise HTTPException(status_code=422, detail="Duración debe estar entre 1 y 12 meses")
 
-            # MAPEAR NIVEL
+            # NIVEL NORMALIZADO
             nivel_map = {
                 "principiante": "principiante",
                 "intermedio": "intermedio",
                 "avanzado": "avanzado"
             }
             nivel_norm = nivel_map.get(solicitud.nivel.lower(), "intermedio")
-            prov = solicitud.proveedor
 
             # ======================================================
-            # 1) GENERAR LA RUTINA (LOCAL, GEMINI, OPENAI, GROK)
+            # PROVEEDOR NORMALIZADO (ÚNICO LUGAR)
+            # ======================================================
+            prov_raw = (solicitud.proveedor or "").strip()
+            print(f"🔥 PROVEEDOR RECIBIDO DESDE ANGULAR: {prov_raw}")
+
+            prov = prov_raw.lower()
+
+            if prov in ["auto", "ia", "inteligente", "fitman", "default", ""]:
+                prov = "gemini"
+
+            print(f"🔥 PROVEEDOR NORMALIZADO: {prov}")
+
+            # ======================================================
+            # 1) GENERAR LA RUTINA SEGÚN PROVEEDOR
             # ======================================================
 
-            generada_por = "local"
-            descripcion = "Rutina generada localmente"
-
-            # LOCAL
             if prov == "local":
+                generada_por = "local"
+                descripcion = "Rutina generada localmente"
+
                 ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
                 if not any(ejercicios_por_grupo.values()):
                     raise HTTPException(status_code=400, detail="No hay ejercicios disponibles en BD")
@@ -1484,15 +1509,16 @@ else:
                     solicitud.perfil_salud
                 )
 
-            # GEMINI
             elif prov == "gemini":
+                print("🔥 LLAMANDO A _gemini_generate_plan() …")
+
                 plan_json = _gemini_generate_plan(
                     perfil=solicitud.perfil_salud,
                     dias=solicitud.dias,
                     nivel=nivel_norm,
                     objetivos=solicitud.objetivos
                 )
-                # === DEBUG CRÍTICO ===
+
                 print("\n================ RAW GEMINI RESPONSE ================")
                 try:
                     print(json.dumps(plan_json, indent=4, ensure_ascii=False))
@@ -1504,7 +1530,6 @@ else:
                 generada_por = "gemini"
                 descripcion = "Rutina generada por Gemini IA"
 
-            # OPENAI
             elif prov == "openai":
                 plan_json = _openai_generate_plan(
                     perfil=solicitud.perfil_salud,
@@ -1516,7 +1541,6 @@ else:
                 generada_por = "openai"
                 descripcion = "Rutina generada por OpenAI"
 
-            # GROK
             elif prov == "grok":
                 plan_json = _grok_generate_plan(
                     perfil=solicitud.perfil_salud,
@@ -1528,6 +1552,20 @@ else:
                 generada_por = "grok"
                 descripcion = "Rutina generada por Grok"
 
+            # FALLBACK LOCAL
+            else:
+                print("⚠ PROVEEDOR DESCONOCIDO, USANDO LOCAL")
+                generada_por = "local"
+                descripcion = "Rutina generada localmente"
+
+                ejercicios_por_grupo = obtener_ejercicios_por_grupo(db, nivel_norm)
+                dias, seguridad = distribuir_ejercicios_inteligente(
+                    ejercicios_por_grupo,
+                    solicitud.dias,
+                    nivel_norm,
+                    solicitud.objetivos,
+                    solicitud.perfil_salud
+                )
             # ======================================================
             # 2) CALCULAR MINUTOS Y DATOS
             # ======================================================

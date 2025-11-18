@@ -14,10 +14,9 @@ from services.message_service import (
     obtener_mensaje,
     marcar_como_leido,
     marcar_conversacion_como_leida,
-    obtener_conversacion,
     obtener_conversaciones,
     contar_no_leidos,
-    eliminar_mensaje,
+    eliminar_mensaje, obtener_conversacion,
 )
 
 router = APIRouter(prefix="/mensajes", tags=["mensajes"])
@@ -25,31 +24,20 @@ router = APIRouter(prefix="/mensajes", tags=["mensajes"])
 
 @router.post("", response_model=MensajeOut, status_code=status.HTTP_201_CREATED)
 def enviar_mensaje_endpoint(
-        user_id: int = Query(..., description="ID del usuario remitente"),
-        payload: MensajeCreate = None,
-        db: Session = Depends(get_db),
+    user_id: int = Query(..., description="ID del usuario remitente"),
+    payload: MensajeCreate = None,
+    db: Session = Depends(get_db),
 ):
-    """
-    🔧 MODIFICADO: Envía un mensaje desde cualquier usuario
-
-    Antes requería autenticación, ahora usa user_id como parámetro
-    """
     if payload is None:
         raise HTTPException(status_code=400, detail="Body del request es requerido")
 
-    # Validar que el remitente existe
     remitente = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
     if not remitente:
         raise HTTPException(status_code=404, detail="Usuario remitente no encontrado")
 
-    # Validar que no se envíe mensaje a sí mismo
     if user_id == payload.id_destinatario:
-        raise HTTPException(
-            status_code=400,
-            detail="No puedes enviarte mensajes a ti mismo"
-        )
+        raise HTTPException(status_code=400, detail="No puedes enviarte mensajes a ti mismo")
 
-    # Validar que el destinatario existe
     destinatario = db.query(Usuario).filter(
         Usuario.id_usuario == payload.id_destinatario
     ).first()
@@ -59,30 +47,19 @@ def enviar_mensaje_endpoint(
     mensaje = enviar_mensaje(db, user_id, payload)
     return mensaje
 
-
 @router.get("/{id_mensaje}", response_model=MensajeOut)
 def obtener_mensaje_endpoint(
-        id_mensaje: int,
-        user_id: int = Query(..., description="ID del usuario que solicita el mensaje"),
-        db: Session = Depends(get_db),
+    id_mensaje: int,
+    user_id: int = Query(..., description="ID del usuario que solicita el mensaje"),
+    db: Session = Depends(get_db),
 ):
-    """
-    🔧 MODIFICADO: Obtiene un mensaje específico
-
-    Antes requería autenticación, ahora usa user_id como parámetro
-    """
     mensaje = obtener_mensaje(db, id_mensaje)
     if not mensaje:
         raise HTTPException(status_code=404, detail="Mensaje no encontrado")
 
-    # Verificar que el usuario tiene permiso para ver el mensaje
     if mensaje.id_remitente != user_id and mensaje.id_destinatario != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="No tienes permiso para ver este mensaje"
-        )
+        raise HTTPException(status_code=403, detail="No tienes permiso para ver este mensaje")
 
-    # Marcar como leído si es el destinatario
     if mensaje.id_destinatario == user_id and not mensaje.leido:
         marcar_como_leido(db, id_mensaje)
         mensaje.leido = True
@@ -92,25 +69,16 @@ def obtener_mensaje_endpoint(
 
 @router.post("/{id_mensaje}/marcar-leido", status_code=status.HTTP_204_NO_CONTENT)
 def marcar_leido_endpoint(
-        id_mensaje: int,
-        user_id: int = Query(..., description="ID del usuario destinatario"),
-        db: Session = Depends(get_db),
+    id_mensaje: int,
+    user_id: int = Query(..., description="ID del usuario destinatario"),
+    db: Session = Depends(get_db),
 ):
-    """
-    🔧 MODIFICADO: Marca un mensaje como leído
-
-    Antes requería autenticación, ahora usa user_id como parámetro
-    """
     mensaje = obtener_mensaje(db, id_mensaje)
     if not mensaje:
         raise HTTPException(status_code=404, detail="Mensaje no encontrado")
 
-    # Solo el destinatario puede marcar como leído
     if mensaje.id_destinatario != user_id:
-        raise HTTPException(
-            status_code=403,
-            detail="Solo el destinatario puede marcar como leído"
-        )
+        raise HTTPException(status_code=403, detail="Solo el destinatario puede marcar como leído")
 
     marcar_como_leido(db, id_mensaje)
     return None
@@ -165,25 +133,43 @@ def obtener_conversacion_endpoint(
         mensajes=mensajes[::-1],  # Invertir orden para mostrar cronológicamente
         total=len(mensajes)
     )
-
-
-@router.get("/mis-conversaciones/lista", response_model=List[ConversacionOut])
-def obtener_conversaciones_endpoint(
-        user_id: int = Query(..., description="ID del usuario"),
-        db: Session = Depends(get_db),
+@router.get("/conversacion/{id_otro_usuario}", response_model=MensajesHistorico)
+def obtener_historial_endpoint(
+    id_otro_usuario: int,
+    user_id: int = Query(..., description="ID del usuario actual"),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
 ):
-    """
-    🔧 MODIFICADO: Obtiene todas las conversaciones de un usuario
+    if user_id == id_otro_usuario:
+        raise HTTPException(status_code=400, detail="No puedes obtener conversación contigo mismo")
 
-    Antes requería autenticación, ahora usa user_id como parámetro
-    """
-    # Validar que el usuario existe
-    usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
-    if not usuario:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    usuario_actual = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
+    if not usuario_actual:
+        raise HTTPException(status_code=404, detail="Usuario actual no encontrado")
 
-    conversaciones = obtener_conversaciones(db, user_id)
-    return conversaciones
+    otro_usuario = db.query(Usuario).filter(Usuario.id_usuario == id_otro_usuario).first()
+    if not otro_usuario:
+        raise HTTPException(status_code=404, detail="Otro usuario no encontrado")
+
+    # Marca como leídos
+    marcar_conversacion_como_leida(db, user_id, id_otro_usuario)
+
+    # Obtener mensajes (esta función ya NO existe, se reemplaza)
+    from sqlalchemy import or_, and_, desc
+    from models.message import Mensaje
+
+    mensajes = db.query(Mensaje).filter(
+        or_(
+            and_(Mensaje.id_remitente == user_id, Mensaje.id_destinatario == id_otro_usuario),
+            and_(Mensaje.id_remitente == id_otro_usuario, Mensaje.id_destinatario == user_id),
+        )
+    ).order_by(desc(Mensaje.fecha_envio)).limit(limit).offset(offset).all()
+
+    return MensajesHistorico(
+        mensajes=mensajes[::-1],
+        total=len(mensajes)
+    )
 
 
 @router.get("/mis-conversaciones/lista", response_model=List[ConversacionOut])
@@ -191,44 +177,26 @@ def obtener_conversaciones_endpoint(
     user_id: int = Query(..., description="ID del usuario"),
     db: Session = Depends(get_db),
 ):
-    """
-    🔧 Obtiene todas las conversaciones de un usuario
-    """
-
-    # Validar que el usuario existe
     usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
     if not usuario:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
-    # Obtener conversaciones en el nuevo FORMATO CORRECTO
-    conversaciones = obtener_conversaciones(db, user_id)
+    return obtener_conversaciones(db, user_id)
 
-    # Si deseas evitar conversaciones vacías (opcional):
-    # conversaciones = [c for c in conversaciones if c.get("ultimo_mensaje")]
 
-    return conversaciones
 
 
 @router.post("/marcar-conversacion-leida/{id_otro_usuario}", status_code=status.HTTP_204_NO_CONTENT)
 def marcar_conversacion_leida_endpoint(
-        id_otro_usuario: int,
-        user_id: int = Query(..., description="ID del usuario actual"),
-        db: Session = Depends(get_db),
+    id_otro_usuario: int,
+    user_id: int = Query(..., description="ID del usuario actual"),
+    db: Session = Depends(get_db),
 ):
-    """
-    🔧 MODIFICADO: Marca una conversación completa como leída
-
-    Antes requería autenticación, ahora usa user_id como parámetro
-    """
-    # Validar que el usuario existe
     usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
     if not usuario:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
-    # Validar que el otro usuario existe
-    otro_usuario = db.query(Usuario).filter(
-        Usuario.id_usuario == id_otro_usuario
-    ).first()
+    otro_usuario = db.query(Usuario).filter(Usuario.id_usuario == id_otro_usuario).first()
     if not otro_usuario:
         raise HTTPException(status_code=404, detail="Otro usuario no encontrado")
 
@@ -236,23 +204,17 @@ def marcar_conversacion_leida_endpoint(
     return None
 
 
+
 @router.delete("/{id_mensaje}", status_code=status.HTTP_204_NO_CONTENT)
 def eliminar_mensaje_endpoint(
-        id_mensaje: int,
-        user_id: int = Query(..., description="ID del usuario remitente"),
-        db: Session = Depends(get_db),
+    id_mensaje: int,
+    user_id: int = Query(..., description="ID del usuario remitente"),
+    db: Session = Depends(get_db),
 ):
-    """
-    🔧 MODIFICADO: Elimina un mensaje
-
-    Antes requería autenticación, ahora usa user_id como parámetro
-    Solo el remitente puede eliminar el mensaje
-    """
     mensaje = obtener_mensaje(db, id_mensaje)
     if not mensaje:
         raise HTTPException(status_code=404, detail="Mensaje no encontrado")
 
-    # Solo el remitente puede eliminar el mensaje
     if mensaje.id_remitente != user_id:
         raise HTTPException(
             status_code=403,
@@ -261,7 +223,6 @@ def eliminar_mensaje_endpoint(
 
     eliminar_mensaje(db, id_mensaje)
     return None
-
 
 # ============================================================
 # ENDPOINTS DE PRUEBA ADICIONALES (SOLO PARA DESARROLLO)
@@ -481,23 +442,24 @@ def obtener_estadisticas_mensajes(
             for d in top_destinatarios
         ]
     }
-
-@router.get("/mis-conversaciones-entrenador/lista", response_model=List[ConversacionOut])
-def obtener_conversaciones_entrenador_endpoint(
-        user_id: int = Query(..., description="ID del entrenador"),
-        db: Session = Depends(get_db),
+@router.get("/no-leidos/contar")
+def contar_no_leidos_endpoint(
+    user_id: int = Query(..., description="ID del usuario"),
+    db: Session = Depends(get_db)
 ):
-    """
-    🔧 NUEVO ENDPOINT:
-    Obtiene las conversaciones de un ENTRENADOR.
+    return {"no_leidos": contar_no_leidos(db, user_id)}
 
 
-    """
+def _usuario_conversacion_usuario_conversacion(u: Usuario) -> dict:
+    rol_value = u.rol.value if hasattr(u.rol, "value") else str(u.rol) if u.rol else None
 
-    # Validar que el usuario existe
-    usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
-    if not usuario:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
+    return {
+        "id_usuario": u.id_usuario,
+        "nombre": u.nombre,
+        "apellido": u.apellido,
+        "foto_url": u.foto_url,
+        "email": u.email,
+        "rol": rol_value
+    }
 
-    conversaciones = obtener_conversaciones(db, user_id)
-    return conversaciones
+

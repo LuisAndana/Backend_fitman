@@ -3,6 +3,9 @@ from fastapi import APIRouter, HTTPException, Query, status, Depends
 from pydantic import BaseModel
 from typing import List, Optional, Dict, Any
 from datetime import datetime, timedelta
+
+from sqlalchemy import text
+
 from db import get_connection
 from sqlalchemy.orm import Session
 from utils.dependencies import get_db
@@ -1277,3 +1280,164 @@ def registrar_sesion(
             cur.close()
             cn.close()
 
+def generar_alertas_progresion_periodica(db: Session):
+    """
+    Genera alertas automáticas cuando un cliente lleva 14–28 días sin aumentar peso
+    o sin registrar sesión en un ejercicio.
+    """
+
+    query = text("""
+        SELECT 
+            he.id_cliente,
+            he.id_ejercicio,
+            e.nombre AS nombre_ejercicio,
+            MAX(he.fecha_sesion) AS ultima_sesion,
+            MAX(he.peso_kg) AS ultimo_peso
+        FROM historial_ejercicio he
+        INNER JOIN ejercicios e ON e.id_ejercicio = he.id_ejercicio
+        GROUP BY he.id_cliente, he.id_ejercicio;
+    """)
+
+    registros = db.execute(query).fetchall()
+
+    hoy = datetime.now()
+
+    for r in registros:
+        id_cliente = r.id_cliente
+        id_ejercicio = r.id_ejercicio
+        nombre_ejercicio = r.nombre_ejercicio
+        ultima_sesion = r.ultima_sesion
+        ultimo_peso = r.ultimo_peso
+
+        if not ultima_sesion:
+            continue
+
+        dias = (hoy - ultima_sesion).days
+
+        # Solo generar alerta si han pasado entre 14 y 28 días
+        if 14 <= dias <= 28:
+
+            # Evitar duplicados
+            existe = db.execute(text("""
+                SELECT id_alerta 
+                FROM alertas_progresion 
+                WHERE id_cliente = :c AND id_ejercicio = :e
+                AND tipo_alerta = 'progresion_retrasada'
+                AND estado = 'pendiente'
+            """), {
+                "c": id_cliente,
+                "e": id_ejercicio
+            }).fetchone()
+
+            if existe:
+                continue
+
+            # Crear alerta
+            db.execute(text("""
+                INSERT INTO alertas_progresion (
+                    id_cliente, id_ejercicio,
+                    tipo_alerta, prioridad, titulo, mensaje,
+                    fecha_creacion, estado
+                ) VALUES (
+                    :c, :e,
+                    'progresion_retrasada', 'media',
+                    :titulo, :mensaje,
+                    NOW(), 'pendiente'
+                )
+            """), {
+                "c": id_cliente,
+                "e": id_ejercicio,
+                "titulo": f"Tiempo de subir peso en {nombre_ejercicio}",
+                "mensaje": f"Han pasado {dias} días desde tu última progresión en {nombre_ejercicio}. "
+                           f"Considera aumentar ligeramente el peso.",
+            })
+
+    db.commit()
+
+@router.post("/alertas/generar-periodicas")
+def alertas_periodicas(db: Session = Depends(get_db)):
+    generar_alertas_progresion_periodica(db)
+    return {"status": "ok", "mensaje": "Alertas generadas"}
+
+
+@router.post("/alertas/generar-automatico/{id_cliente}")
+def generar_alertas_auto(id_cliente: int, db: Session = Depends(get_db)):
+    """
+    Genera alertas cada 2-4 semanas basado en el progreso real del cliente.
+    """
+
+    # 💾 1. Obtener ejercicios con progreso
+    query = text("""
+        SELECT 
+            he.id_ejercicio,
+            e.nombre,
+            MAX(he.fecha_sesion) AS ultima_sesion,
+            MAX(he.peso_kg) AS peso_actual,
+            MIN(he.peso_kg) AS peso_inicial
+        FROM historial_ejercicios he
+        INNER JOIN ejercicios e ON he.id_ejercicio = e.id_ejercicio
+        WHERE he.id_cliente = :cliente
+        GROUP BY he.id_ejercicio
+    """)
+
+    registros = db.execute(query, {"cliente": id_cliente}).fetchall()
+
+    nuevas_alertas = 0
+
+    for r in registros:
+        id_ejercicio = r[0]
+        nombre = r[1]
+        ultima = r[2]
+        peso_actual = r[3]
+        peso_inicial = r[4]
+
+        if not ultima:
+            continue
+
+        # 🧮 Calcular días desde última sesión
+        ultima_dt = datetime.strptime(str(ultima), "%Y-%m-%d %H:%M:%S")
+        dias = (datetime.now() - ultima_dt).days
+
+        if dias < 14:
+            continue  # No ha pasado el periodo mínimo
+
+        # Si está entre 14-27 días → prioridad media
+        if 14 <= dias <= 27:
+            prioridad = "media"
+            mensaje = (
+                f"Han pasado {dias} días desde tu última sesión del ejercicio '{nombre}'. "
+                "Considera aumentar ligeramente el peso si te sientes capaz."
+            )
+        else:
+            prioridad = "alta"
+            mensaje = (
+                f"Hace más de {dias} días que no entrenas '{nombre}'. "
+                "Es importante retomar o ajustar la carga."
+            )
+
+        # Si el peso lleva igual mucho tiempo → estancamiento
+        if peso_actual == peso_inicial and dias >= 21:
+            prioridad = "alta"
+            mensaje = (
+                f"No has aumentado peso en '{nombre}' desde hace más de {dias} días. "
+                "Probable estancamiento detectado."
+            )
+
+        # 📌 Guardar alerta
+        db.execute(text("""
+            INSERT INTO alertas_progresion
+            (id_cliente, tipo_alerta, prioridad, titulo, mensaje, id_ejercicio)
+            VALUES (:c, 'progresion', :p, :t, :m, :e)
+        """), {
+            "c": id_cliente,
+            "p": prioridad,
+            "t": f"Progresión para {nombre}",
+            "m": mensaje,
+            "e": id_ejercicio
+        })
+
+        nuevas_alertas += 1
+
+    db.commit()
+
+    return {"alertas_generadas": nuevas_alertas}

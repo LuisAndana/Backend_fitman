@@ -193,6 +193,12 @@ class RutinaConValidacion(BaseModel):
     dias_por_semana: int
     dias: List[DiaRutinaResponse]
 
+    class SolicitudGenerarRutina(BaseModel):
+        objetivo: str
+        nivel: str
+        dias_entrenamiento: int
+        grupos_musculares: List[str]
+
     @staticmethod
     def validar_rutina(rutina: 'RutinaConValidacion') -> bool:
         """
@@ -208,3 +214,4 @@ class RutinaConValidacion(BaseModel):
                 raise ValueError(f"Día {dia.nombre_dia} no tiene ejercicios")
 
         return True
+

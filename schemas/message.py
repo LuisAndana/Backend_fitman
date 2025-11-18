@@ -34,11 +34,13 @@ class MensajeOut(BaseModel):
 # --------------------------
 class UltimoMensaje(BaseModel):
     id_mensaje: int
+    id_remitente: int
+    id_destinatario: int
     contenido: str
     fecha_envio: datetime
     leido: bool
-    id_remitente: int
-    id_destinatario: int
+    es_remitente: bool
+
 
     class Config:
         from_attributes = True

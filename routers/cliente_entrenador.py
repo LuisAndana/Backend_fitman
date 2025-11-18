@@ -54,6 +54,8 @@ class ClienteOut(BaseModel):
     enfermedades: Optional[List[str]] = None
     condiciones_medicas: Optional[List[str]] = None
     fecha_nacimiento: Optional[str] = None
+    rol: Optional[str] = None  # ← AGREGADO
+
 
     class Config:
         from_attributes = True
@@ -67,6 +69,8 @@ class EntrenadorOut(BaseModel):
     foto_url: Optional[str] = None
     email: str
     ciudad: Optional[str] = None
+    rol: Optional[str] = None  # ← AGREGADO
+
 
 
 class ClienteConRelacionOut(BaseModel):
@@ -136,46 +140,43 @@ def _cliente_out(u: Usuario) -> ClienteOut:
         if sexo:
             sexo_value = sexo.value if hasattr(sexo, 'value') else str(sexo)
 
-    estatura = getattr(u, 'estatura_cm', None)
-    problemas = getattr(u, 'problemas', None)
-    peso = getattr(u, 'peso_kg', None)
-    foto_url = getattr(u, 'foto_url', None)
-    enfermedades = getattr(u, 'enfermedades', None)
+    enfermedades = getattr(u, "enfermedades", None)
 
     cliente_dict = {
         "id_usuario": int(u.id_usuario),
         "nombre": getattr(u, "nombre", ""),
         "apellido": _obtener_apellido(u),
         "email": u.email,
-        "foto_url": foto_url,
+        "foto_url": getattr(u, "foto_url", None),
         "avatar_url": getattr(u, "avatar_url", None),
         "ciudad": getattr(u, "ciudad", None),
         "edad": getattr(u, "edad", None),
-        "peso": float(peso) if peso else None,
-        "estatura": estatura,
+        "peso": float(getattr(u, "peso_kg", None)) if getattr(u, "peso_kg", None) else None,
+        "estatura": getattr(u, "estatura_cm", None),
         "imc": float(getattr(u, "imc", None)) if getattr(u, "imc", None) else None,
-        "peso_kg": float(peso) if peso else None,
+        "peso_kg": float(getattr(u, "peso_kg", None)) if getattr(u, "peso_kg", None) else None,
         "sexo": sexo_value,
-        "antecedentes": problemas,
-        "problemas_medicos": problemas,
+        "antecedentes": getattr(u, "problemas", None),
+        "problemas_medicos": getattr(u, "problemas", None),
         "enfermedades": _parse_enfermedades(enfermedades),
         "condiciones_medicas": None,
         "fecha_nacimiento": None,
+        "rol": _rol_str(u)  # ← AGREGADO
     }
 
     return ClienteOut(**cliente_dict)
 
 
-def _entrenador_out(u: Usuario) -> EntrenadorOut:
-    return EntrenadorOut(
-        id_usuario=int(u.id_usuario),
-        nombre=_nombre_completo(u),
-        especialidad=getattr(u, "especialidad", None),
-        rating=float(getattr(u, "rating", None)) if getattr(u, "rating", None) else None,
-        foto_url=getattr(u, "foto_url", None),
-        email=u.email,
-        ciudad=getattr(u, "ciudad", None),
-    )
+class EntrenadorOut(BaseModel):
+    id_usuario: int
+    nombre: str
+    especialidad: Optional[str] = None
+    rating: Optional[float] = None
+    foto_url: Optional[str] = None
+    email: str
+    ciudad: Optional[str] = None
+    rol: Optional[str] = None  # ← AGREGADO
+
 
 
 # ============================================================
@@ -263,6 +264,22 @@ def mis_clientes(id_entrenador: int, db: Session = Depends(get_db)):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+def _entrenador_out(u: Usuario) -> EntrenadorOut:
+    rol_value = _rol_str(u)
+
+    return EntrenadorOut(
+        id_usuario=int(u.id_usuario),
+        nombre=_nombre_completo(u),
+        especialidad=getattr(u, "especialidad", None),
+        rating=float(getattr(u, "rating", None)) if getattr(u, "rating", None) else None,
+        foto_url=getattr(u, "foto_url", None),
+        email=u.email,
+        ciudad=getattr(u, "ciudad", None),
+        rol=rol_value  # ← AGREGADO
+    )
+
 
 
 @router.get("/mi-entrenador/{id_cliente}", response_model=Optional[EntrenadorConRelacionOut])

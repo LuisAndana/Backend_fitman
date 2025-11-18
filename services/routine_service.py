@@ -1,68 +1,66 @@
 # services/rutina_service.py - Servicio completo para rutinas
-
 from sqlalchemy.orm import Session
 from typing import List, Optional, Dict
 from datetime import datetime
-import json
-from models.rutina import Rutina, DiaRutina, EjercicioDiaRutina, EstadoRutina
-from schemas.rutina_schemas import (
-    ParametrosRutinaCreate, RutinaDetailResponse, RutinaListResponse
+
+from models.routine import (
+    Rutina, DiaRutina, EjercicioDiaRutina, EstadoRutina
 )
+
+from schemas.routine import(
+    ParametrosRutinaCreate,
+    DiaRutinaCreate,
+    EjercicioDiaRutinaCreate,
+    RutinaUpdate,
+    EjercicioDiaRutinaUpdate,
+)
+
+from schemas.routine import RutinaDetailResponse
 
 
 class RutinaService:
     """Servicio para gestionar rutinas"""
 
-    @staticmethod
     def crear_rutina(
-            db: Session,
-            parametros: ParametrosRutinaCreate,
-            dias_config: List[Dict]
+        db: Session,
+        parametros: ParametrosRutinaCreate,
+        dias_config: List[Dict]
     ) -> Rutina:
-        """
-        Crea una rutina completa con todos sus días y ejercicios.
 
-        Args:
-            db: Sesión de BD
-            parametros: Parámetros iniciales
-            dias_config: Lista con configuración de cada día
-
-        Returns:
-            Rutina creada
-        """
-        # Crear rutina principal
         rutina = Rutina(
             id_usuario=parametros.id_usuario,
             id_entrenador=parametros.id_entrenador,
             nombre=parametros.nombre_rutina,
+            descripcion=None,
             dias_por_semana=parametros.dias_por_semana,
-            nivel_dificultad=parametros.nivel_dificultad,
+            nivel_dificultad=parametros.nivel_dificultad.value,
             grupo_muscular_enfoque=parametros.grupo_muscular_enfoque,
             problemas_alumno=parametros.problemas,
             enfermedades_alumno=parametros.enfermedades,
             objetivo_alumno=parametros.objetivo_alumno,
             estado=EstadoRutina.EN_EDICION
         )
-        db.add(rutina)
-        db.flush()  # Para obtener el ID sin commit
 
-        # Crear días y ejercicios
+        db.add(rutina)
+        db.flush()
+
+        # Crear días
         for dia_data in dias_config:
             dia_rutina = DiaRutina(
                 id_rutina=rutina.id_rutina,
-                numero_dia=dia_data.get("numero_dia"),
-                nombre_dia=dia_data.get("nombre_dia"),
+                numero_dia=dia_data["numero_dia"],
+                nombre_dia=dia_data["nombre_dia"],
                 descripcion=dia_data.get("descripcion"),
                 activo=True
             )
             db.add(dia_rutina)
             db.flush()
 
-            # Agregar ejercicios al día
-            for orden, ejercicio_data in enumerate(dia_data.get("ejercicios", []), 1):
-                ejercicio_dia = EjercicioDiaRutina(
+            # Crear ejercicios
+            for orden, ejercicio_data in enumerate(dia_data.get("ejercicios", []), start=1):
+                ejercicio = EjercicioDiaRutina(
                     id_dia_rutina=dia_rutina.id_dia_rutina,
-                    id_ejercicio=ejercicio_data.get("id_ejercicio"),
+                    id_ejercicio=ejercicio_data["id_ejercicio"],
                     orden=orden,
                     series=ejercicio_data.get("series", 3),
                     repeticiones=ejercicio_data.get("repeticiones"),
@@ -71,22 +69,23 @@ class RutinaService:
                     descanso_segundos=ejercicio_data.get("descanso_segundos", 60),
                     notas=ejercicio_data.get("notas")
                 )
-                db.add(ejercicio_dia)
+                db.add(ejercicio)
 
         db.commit()
         db.refresh(rutina)
         return rutina
+
 
     @staticmethod
     def actualizar_rutina(
             db: Session,
             id_rutina: int,
             **kwargs
-    ) -> Optional[Rutina]:
+    ) -> Optional[RutinaDetailResponse]:
         """
         Actualiza campos de una rutina.
         """
-        rutina = db.query(Rutina).filter(Rutina.id_rutina == id_rutina).first()
+        rutina = db.query(RutinaDetailResponse).filter(RutinaDetailResponse.id_rutina == id_rutina).first()
         if not rutina:
             return None
 
@@ -101,28 +100,20 @@ class RutinaService:
 
     @staticmethod
     def obtener_rutina(db: Session, id_rutina: int) -> Optional[Rutina]:
-        """Obtiene una rutina por ID"""
         return db.query(Rutina).filter(Rutina.id_rutina == id_rutina).first()
 
     @staticmethod
     def obtener_rutinas_usuario(db: Session, id_usuario: int) -> List[Rutina]:
-        """Obtiene todas las rutinas de un usuario"""
         return db.query(Rutina).filter(Rutina.id_usuario == id_usuario).all()
 
     @staticmethod
     def obtener_rutinas_entrenador(db: Session, id_entrenador: int) -> List[Rutina]:
-        """Obtiene todas las rutinas que un entrenador ha creado"""
         return db.query(Rutina).filter(Rutina.id_entrenador == id_entrenador).all()
 
-    @staticmethod
     def eliminar_rutina(db: Session, id_rutina: int) -> bool:
-        """
-        Elimina una rutina y todos sus días/ejercicios (cascada).
-        """
         rutina = db.query(Rutina).filter(Rutina.id_rutina == id_rutina).first()
         if not rutina:
             return False
-
         db.delete(rutina)
         db.commit()
         return True
@@ -135,31 +126,26 @@ class RutinaService:
             orden: int,
             **kwargs
     ) -> EjercicioDiaRutina:
-        """Agrega un ejercicio a un día de rutina"""
-        ejercicio_dia = EjercicioDiaRutina(
+
+        ejercicio = EjercicioDiaRutina(
             id_dia_rutina=id_dia_rutina,
             id_ejercicio=id_ejercicio,
             orden=orden,
             **kwargs
         )
-        db.add(ejercicio_dia)
+
+        db.add(ejercicio)
         db.commit()
-        db.refresh(ejercicio_dia)
-        return ejercicio_dia
+        db.refresh(ejercicio)
+        return ejercicio
 
     @staticmethod
-    def eliminar_ejercicio_de_dia(
-            db: Session,
-            id_ejercicio_dia: int
-    ) -> bool:
-        """Elimina un ejercicio de un día"""
+    def eliminar_ejercicio_de_dia(db: Session, id_ejercicio_dia: int) -> bool:
         ejercicio = db.query(EjercicioDiaRutina).filter(
             EjercicioDiaRutina.id_ejercicio_dia == id_ejercicio_dia
         ).first()
-
         if not ejercicio:
             return False
-
         db.delete(ejercicio)
         db.commit()
         return True
@@ -170,7 +156,7 @@ class RutinaService:
             id_ejercicio_dia: int,
             **kwargs
     ) -> Optional[EjercicioDiaRutina]:
-        """Actualiza un ejercicio dentro de un día"""
+
         ejercicio = db.query(EjercicioDiaRutina).filter(
             EjercicioDiaRutina.id_ejercicio_dia == id_ejercicio_dia
         ).first()
@@ -179,7 +165,7 @@ class RutinaService:
             return None
 
         for key, value in kwargs.items():
-            if hasattr(ejercicio, key) and value is not None:
+            if value is not None and hasattr(ejercicio, key):
                 setattr(ejercicio, key, value)
 
         db.commit()
@@ -192,12 +178,13 @@ class RutinaService:
             id_rutina: int,
             nuevo_estado: EstadoRutina
     ) -> Optional[Rutina]:
-        """Cambia el estado de una rutina"""
+
         rutina = db.query(Rutina).filter(Rutina.id_rutina == id_rutina).first()
         if not rutina:
             return None
 
         rutina.estado = nuevo_estado
+
         if nuevo_estado == EstadoRutina.ACTIVA and not rutina.fecha_inicio:
             rutina.fecha_inicio = datetime.utcnow()
 
@@ -211,14 +198,14 @@ class RutinaService:
             id_rutina: int,
             id_nuevo_usuario: int,
             nombre_nueva: str = None
-    ) -> Optional[Rutina]:
+    ) -> Optional[RutinaDetailResponse]:
         """Duplica una rutina para otro usuario"""
-        rutina_original = db.query(Rutina).filter(Rutina.id_rutina == id_rutina).first()
+        rutina_original = db.query(RutinaDetailResponse).filter(RutinaDetailResponse.id_rutina == id_rutina).first()
         if not rutina_original:
             return None
 
         # Crear nueva rutina
-        nueva_rutina = Rutina(
+        nueva_rutina = RutinaDetailResponse(
             id_usuario=id_nuevo_usuario,
             id_entrenador=rutina_original.id_entrenador,
             nombre=nombre_nueva or f"{rutina_original.nombre} (Copia)",
@@ -267,7 +254,7 @@ class RutinaService:
     @staticmethod
     def exportar_rutina_json(db: Session, id_rutina: int) -> Dict:
         """Exporta una rutina a formato JSON"""
-        rutina = db.query(Rutina).filter(Rutina.id_rutina == id_rutina).first()
+        rutina = db.query(RutinaDetailResponse).filter(RutinaDetailResponse.id_rutina == id_rutina).first()
         if not rutina:
             return None
 

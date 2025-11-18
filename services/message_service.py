@@ -62,6 +62,7 @@ def obtener_conversacion(
     offset: int = 0
 ) -> list[Mensaje]:
     """Obtiene todos los mensajes entre dos usuarios"""
+
     return db.query(Mensaje).filter(
         or_(
             and_(Mensaje.id_remitente == id_usuario1, Mensaje.id_destinatario == id_usuario2),
@@ -69,17 +70,16 @@ def obtener_conversacion(
         )
     ).order_by(desc(Mensaje.fecha_envio)).limit(limit).offset(offset).all()
 
+
 def obtener_conversaciones(db: Session, id_usuario: int) -> list[dict]:
-    """Obtiene todas las conversaciones con el formato correcto"""
+    """Obtiene todas las conversaciones con formato correcto"""
 
     usuarios_set = set()
 
-    # Usuarios con mensajes enviados
     enviados = db.query(Mensaje.id_destinatario).filter(
         Mensaje.id_remitente == id_usuario
     ).distinct().all()
 
-    # Usuarios con mensajes recibidos
     recibidos = db.query(Mensaje.id_remitente).filter(
         Mensaje.id_destinatario == id_usuario
     ).distinct().all()
@@ -93,7 +93,6 @@ def obtener_conversaciones(db: Session, id_usuario: int) -> list[dict]:
 
     for otro_id in usuarios_set:
 
-        # --- Obtener datos del usuario ---
         otro_usuario = db.query(Usuario).filter(
             Usuario.id_usuario == otro_id
         ).first()
@@ -101,51 +100,45 @@ def obtener_conversaciones(db: Session, id_usuario: int) -> list[dict]:
         if not otro_usuario:
             continue
 
-        # --- Último mensaje completo ---
-        ultimo_msg = db.query(Mensaje).filter(
+        ultimo_msg: Mensaje = db.query(Mensaje).filter(
             or_(
-                and_(
-                    Mensaje.id_remitente == id_usuario,
-                    Mensaje.id_destinatario == otro_id
-                ),
-                and_(
-                    Mensaje.id_remitente == otro_id,
-                    Mensaje.id_destinatario == id_usuario
-                )
+                and_(Mensaje.id_remitente == id_usuario,
+                     Mensaje.id_destinatario == otro_id),
+                and_(Mensaje.id_remitente == otro_id,
+                     Mensaje.id_destinatario == id_usuario),
             )
         ).order_by(desc(Mensaje.fecha_envio)).first()
 
         if not ultimo_msg:
-            continue   # Evita filas vacías
+            continue
 
-        # --- Contar mensajes no leídos ---
         no_leidos = db.query(Mensaje).filter(
             Mensaje.id_destinatario == id_usuario,
             Mensaje.id_remitente == otro_id,
             Mensaje.leido == False
         ).count()
 
-        # --- Formato CORRECTO para Angular ---
         conversaciones.append({
             "otro_usuario": {
                 "id_usuario": otro_usuario.id_usuario,
                 "nombre": otro_usuario.nombre,
                 "apellido": otro_usuario.apellido,
-                "foto_url": getattr(otro_usuario, "foto_url", None),
-                "rol": otro_usuario.rol
+                "email": otro_usuario.email,
+                "foto_url": otro_usuario.foto_url,
             },
             "ultimo_mensaje": {
-                "id_mensaje": ultimo_msg.id_mensaje,
-                "contenido": ultimo_msg.contenido,
-                "fecha_envio": ultimo_msg.fecha_envio,
-                "leido": ultimo_msg.leido,
-                "id_remitente": ultimo_msg.id_remitente,
-                "id_destinatario": ultimo_msg.id_destinatario
-            },
+    "id_mensaje": ultimo_msg.id_mensaje,
+    "id_remitente": ultimo_msg.id_remitente,
+    "id_destinatario": ultimo_msg.id_destinatario,
+    "contenido": ultimo_msg.contenido,
+    "fecha_envio": ultimo_msg.fecha_envio,
+    "leido": ultimo_msg.leido,
+    "es_remitente": ultimo_msg.id_remitente == id_usuario
+},
+
             "mensajes_no_leidos": no_leidos
         })
 
-    # --- Ordenar por fecha ---
     conversaciones.sort(
         key=lambda x: x["ultimo_mensaje"]["fecha_envio"],
         reverse=True

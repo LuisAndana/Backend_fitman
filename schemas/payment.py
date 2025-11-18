@@ -4,11 +4,15 @@ from typing import Optional, List
 from datetime import datetime
 
 
+from datetime import datetime
+
 class PagoCreate(BaseModel):
     id_entrenador: int
     monto: float
-    periodo_mes: int
-    periodo_anio: int
+    descripcion: str
+    periodo_mes: int = 1                     # Pago mensual
+    periodo_anio: int = datetime.now().year  # Año actual
+
     metodo_pago: Optional[str] = None
 
 

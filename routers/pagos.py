@@ -2,6 +2,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
 from typing import List
+from utils.stripe_client import create_payment_intent
 
 from utils.dependencies import get_db
 from schemas.payment import (
@@ -194,3 +195,59 @@ def obtener_suscriptores_endpoint(
     """Obtiene todos los suscriptores activos del entrenador"""
     suscripciones = obtener_suscripciones_entrenador(db, id_entrenador)
     return suscripciones
+
+
+@router.post("/stripe/payment-intent")
+def stripe_create_payment_intent(
+        id_cliente: int = Query(...),
+        id_entrenador: int = Query(...),
+        monto: int = Query(..., description="Monto en centavos"),
+        db: Session = Depends(get_db),
+):
+    """
+    Crea un PaymentIntent REAL en Stripe
+    """
+    try:
+        # 1️⃣ Registrar pago en BD como "pendiente"
+        payload = PagoCreate(
+            id_entrenador=id_entrenador,
+            monto=monto / 100,          # convertir centavos → pesos (ej: 200000 → 2000)
+            descripcion="Pago con Stripe",
+            periodo_mes=1,
+            periodo_anio=2025
+        )
+
+        pago = crear_pago(db, id_cliente, payload)
+
+        # 2️⃣ Crear PaymentIntent real en Stripe con metadata
+        intent = create_payment_intent(
+            amount=monto,
+            metadata={
+                "id_pago": pago.id_pago,
+                "id_cliente": id_cliente,
+                "id_entrenador": id_entrenador
+            }
+        )
+
+        # 3️⃣ Responder al cliente Angular
+        return {
+            "client_secret": intent.client_secret,
+            "id_pago": pago.id_pago
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+        # 3️⃣ Devolvemos lo necesario para Angular
+        return {
+            "client_secret": intent.client_secret,
+            "id_pago": pago.id_pago
+        }
+
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))

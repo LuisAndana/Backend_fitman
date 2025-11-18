@@ -54,37 +54,32 @@ def marcar_conversacion_como_leida(db: Session, id_usuario: int, id_otro_usuario
     db.commit()
     return len(mensajes)
 
-
 def obtener_conversacion(
-        db: Session,
-        id_usuario1: int,
-        id_usuario2: int,
-        limit: int = 50,
-        offset: int = 0
+    db: Session,
+    id_usuario1: int,
+    id_usuario2: int,
+    limit: int = 50,
+    offset: int = 0
 ) -> list[Mensaje]:
     """Obtiene todos los mensajes entre dos usuarios"""
     return db.query(Mensaje).filter(
         or_(
-            and_(
-                Mensaje.id_remitente == id_usuario1,
-                Mensaje.id_destinatario == id_usuario2
-            ),
-            and_(
-                Mensaje.id_remitente == id_usuario2,
-                Mensaje.id_destinatario == id_usuario1
-            )
+            and_(Mensaje.id_remitente == id_usuario1, Mensaje.id_destinatario == id_usuario2),
+            and_(Mensaje.id_remitente == id_usuario2, Mensaje.id_destinatario == id_usuario1)
         )
     ).order_by(desc(Mensaje.fecha_envio)).limit(limit).offset(offset).all()
 
-
 def obtener_conversaciones(db: Session, id_usuario: int) -> list[dict]:
-    """Obtiene todas las conversaciones únicas del usuario"""
+    """Obtiene todas las conversaciones con el formato correcto"""
+
     usuarios_set = set()
 
+    # Usuarios con mensajes enviados
     enviados = db.query(Mensaje.id_destinatario).filter(
         Mensaje.id_remitente == id_usuario
     ).distinct().all()
 
+    # Usuarios con mensajes recibidos
     recibidos = db.query(Mensaje.id_remitente).filter(
         Mensaje.id_destinatario == id_usuario
     ).distinct().all()
@@ -95,11 +90,18 @@ def obtener_conversaciones(db: Session, id_usuario: int) -> list[dict]:
         usuarios_set.add(row[0])
 
     conversaciones = []
+
     for otro_id in usuarios_set:
-        otro_usuario = db.query(Usuario).filter(Usuario.id_usuario == otro_id).first()
+
+        # --- Obtener datos del usuario ---
+        otro_usuario = db.query(Usuario).filter(
+            Usuario.id_usuario == otro_id
+        ).first()
+
         if not otro_usuario:
             continue
 
+        # --- Último mensaje completo ---
         ultimo_msg = db.query(Mensaje).filter(
             or_(
                 and_(
@@ -113,23 +115,39 @@ def obtener_conversaciones(db: Session, id_usuario: int) -> list[dict]:
             )
         ).order_by(desc(Mensaje.fecha_envio)).first()
 
+        if not ultimo_msg:
+            continue   # Evita filas vacías
+
+        # --- Contar mensajes no leídos ---
         no_leidos = db.query(Mensaje).filter(
             Mensaje.id_destinatario == id_usuario,
             Mensaje.id_remitente == otro_id,
             Mensaje.leido == False
         ).count()
 
+        # --- Formato CORRECTO para Angular ---
         conversaciones.append({
-            "id_usuario": otro_id,
-            "nombre_completo": f"{otro_usuario.nombre} {otro_usuario.apellido}",
-            "foto_url": getattr(otro_usuario, "foto_url", None),
-            "ultimo_mensaje": ultimo_msg.contenido if ultimo_msg else None,
-            "fecha_ultimo_mensaje": ultimo_msg.fecha_envio if ultimo_msg else None,
-            "mensajes_no_leidos": no_leidos,
+            "otro_usuario": {
+                "id_usuario": otro_usuario.id_usuario,
+                "nombre": otro_usuario.nombre,
+                "apellido": otro_usuario.apellido,
+                "foto_url": getattr(otro_usuario, "foto_url", None),
+                "rol": otro_usuario.rol
+            },
+            "ultimo_mensaje": {
+                "id_mensaje": ultimo_msg.id_mensaje,
+                "contenido": ultimo_msg.contenido,
+                "fecha_envio": ultimo_msg.fecha_envio,
+                "leido": ultimo_msg.leido,
+                "id_remitente": ultimo_msg.id_remitente,
+                "id_destinatario": ultimo_msg.id_destinatario
+            },
+            "mensajes_no_leidos": no_leidos
         })
 
+    # --- Ordenar por fecha ---
     conversaciones.sort(
-        key=lambda x: x["fecha_ultimo_mensaje"] or datetime.min,
+        key=lambda x: x["ultimo_mensaje"]["fecha_envio"],
         reverse=True
     )
 

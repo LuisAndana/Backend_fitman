@@ -186,23 +186,27 @@ def obtener_conversaciones_endpoint(
     return conversaciones
 
 
-@router.get("/no-leidos/contar")
-def contar_no_leidos_endpoint(
-        user_id: int = Query(..., description="ID del usuario"),
-        db: Session = Depends(get_db),
+@router.get("/mis-conversaciones/lista", response_model=List[ConversacionOut])
+def obtener_conversaciones_endpoint(
+    user_id: int = Query(..., description="ID del usuario"),
+    db: Session = Depends(get_db),
 ):
     """
-    🔧 MODIFICADO: Cuenta los mensajes no leídos de un usuario
-
-    Antes requería autenticación, ahora usa user_id como parámetro
+    🔧 Obtiene todas las conversaciones de un usuario
     """
+
     # Validar que el usuario existe
     usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
     if not usuario:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
-    total = contar_no_leidos(db, user_id)
-    return {"no_leidos": total}
+    # Obtener conversaciones en el nuevo FORMATO CORRECTO
+    conversaciones = obtener_conversaciones(db, user_id)
+
+    # Si deseas evitar conversaciones vacías (opcional):
+    # conversaciones = [c for c in conversaciones if c.get("ultimo_mensaje")]
+
+    return conversaciones
 
 
 @router.post("/marcar-conversacion-leida/{id_otro_usuario}", status_code=status.HTTP_204_NO_CONTENT)

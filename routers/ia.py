@@ -9,7 +9,7 @@ import google.generativeai as genai
 import os
 import json
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 from utils.dependencies import get_db
 
@@ -311,6 +311,24 @@ else:
     # ============================================================
     # FUNCIONES DE VIGENCIA - NUEVO
     # ============================================================
+    def extract_json_safe(text: str) -> dict:
+        """
+        Permite recuperar JSON incluso si Gemini lo corta por límite de tokens.
+        Busca el primer '{' y el último '}' y reconstruye el JSON.
+        """
+        start = text.find("{")
+        end = text.rfind("}")
+
+        if start == -1 or end == -1:
+            raise ValueError("No se encontró JSON en la salida de Gemini.")
+
+        try:
+            return json.loads(text[start:end + 1])
+        except Exception:
+            # si hay errores de comas, quitar comas colgantes
+            cleaned = re.sub(r",\s*([}\]])", r"\1", text[start:end + 1])
+            return json.loads(cleaned)
+
 
     def calcular_fechas_vigencia(meses: int) -> dict:
         """
@@ -626,24 +644,186 @@ else:
         db.commit()
 
 
-    def crear_objetivos_iniciales(db, id_cliente, id_rutina):
+    def crear_objetivo_automatico(db, id_cliente: int, tipo: str):
         """
-        Crea objetivos automáticos basados en una rutina nueva
+        Crea un objetivo automáticamente basado en el tipo.
+        Tipos válidos según tu tabla:
+          - peso_corporal
+          - grasa_corporal
+          - peso_ejercicio
+          - repeticiones
+          - semanal
+          - mensual
         """
-        query = text("""
+
+        objetivos = {
+            "completar_rutina": {
+                "tipo_objetivo": "semanal",
+                "titulo": "Completar rutina semanal",
+                "descripcion": "Debe completar todos los días de la rutina activa.",
+                "valor_inicial": 0,
+                "valor_objetivo": 100,
+                "valor_actual": 0,
+                "unidad": "%",
+                "fecha_inicio": date.today(),
+                "fecha_limite": date.today() + timedelta(days=7),
+            },
+
+            "progreso_ejercicio": {
+                "tipo_objetivo": "peso_ejercicio",
+                "titulo": "Mejorar marca personal",
+                "descripcion": "Incrementar peso total levantado en ejercicio clave.",
+                "valor_inicial": 0,
+                "valor_objetivo": 10,
+                "valor_actual": 0,
+                "unidad": "kg",
+                "fecha_inicio": date.today(),
+                "fecha_limite": date.today() + timedelta(days=30),
+            },
+
+            "perder_peso": {
+                "tipo_objetivo": "peso_corporal",
+                "titulo": "Reducir peso corporal",
+                "descripcion": "Meta mensual de pérdida de peso.",
+                "valor_inicial": 0,
+                "valor_objetivo": 2,
+                "valor_actual": 0,
+                "unidad": "kg",
+                "fecha_inicio": date.today(),
+                "fecha_limite": date.today() + timedelta(days=30),
+            }
+        }
+
+        if tipo not in objetivos:
+            raise ValueError("Tipo de objetivo no válido.")
+
+        data = objetivos[tipo]
+
+        sql = """
+            INSERT INTO objetivos_cliente (
+                id_cliente,
+                tipo_objetivo,
+                titulo,
+                descripcion,
+                valor_inicial,
+                valor_objetivo,
+                valor_actual,
+                unidad,
+                fecha_inicio,
+                fecha_limite,
+                estado,
+                porcentaje_completado
+            ) VALUES (
+                :id_cliente,
+                :tipo_objetivo,
+                :titulo,
+                :descripcion,
+                :valor_inicial,
+                :valor_objetivo,
+                :valor_actual,
+                :unidad,
+                :fecha_inicio,
+                :fecha_limite,
+                'pendiente',
+                0
+            )
+        """
+
+        db.execute(sql, {
+            "id_cliente": id_cliente,
+            **data
+        })
+        db.commit()
+
+        return {"ok": True, "mensaje": "Objetivo creado automáticamente"}
+
+
+    def crear_objetivos_iniciales(db: Session, id_cliente: int, id_rutina: int, rutina: RutinaCompleta):
+        """
+        Crea 3 objetivos automáticos según la rutina generada por IA:
+        1) Completar todos los días de la rutina
+        2) Finalizar todas las semanas
+        3) Objetivo específico según meta del usuario (glúteos, bajar grasa, fuerza, etc.)
+        """
+
+        dias_total = rutina.dias_semana
+        semanas_total = rutina.duracion_meses * 4  # aproximado
+        objetivo_usuario = rutina.objetivo.lower()
+
+        # --- OBJETIVO 1: COMPLETAR DIAS ---
+        db.execute(text("""
             INSERT INTO objetivos_cliente (
                 id_cliente, tipo_objetivo, titulo,
                 valor_objetivo, valor_actual, unidad,
                 estado, porcentaje_completado, fecha_inicio, fecha_limite
             )
             VALUES (
-                :cliente, 'progreso', 'Completar rutina',
-                100, 0, '%',
+                :cliente, 'progreso', 'Completar los días de entrenamiento',
+                :meta, 0, 'dias',
+                'pendiente', 0, NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)
+            )
+        """), {
+            "cliente": id_cliente,
+            "meta": dias_total
+        })
+
+        # --- OBJETIVO 2: COMPLETAR SEMANAS ---
+        db.execute(text("""
+            INSERT INTO objetivos_cliente (
+                id_cliente, tipo_objetivo, titulo,
+                valor_objetivo, valor_actual, unidad,
+                estado, porcentaje_completado, fecha_inicio, fecha_limite
+            )
+            VALUES (
+                :cliente, 'progreso', 'Terminar todas las semanas de la rutina',
+                :meta, 0, 'semanas',
+                'pendiente', 0, NOW(), DATE_ADD(NOW(), INTERVAL :meses MONTH)
+            )
+        """), {
+            "cliente": id_cliente,
+            "meta": semanas_total,
+            "meses": rutina.duracion_meses
+        })
+
+        # --- OBJETIVO 3: DINÁMICO SEGÚN META DEL CLIENTE ---
+        titulo_obj = "Mejorar condición física"
+        unidad = "%"
+        meta_valor = 100
+
+        if "glute" in objetivo_usuario:
+            titulo_obj = "Incrementar fuerza y volumen de glúteos"
+        elif "bajar" in objetivo_usuario or "grasa" in objetivo_usuario:
+            titulo_obj = "Reducir porcentaje de grasa corporal"
+            unidad = "%"
+            meta_valor = 5
+        elif "fuerza" in objetivo_usuario:
+            titulo_obj = "Aumentar fuerza general"
+            unidad = "%"
+            meta_valor = 20
+        elif "musculo" in objetivo_usuario or "masa" in objetivo_usuario:
+            titulo_obj = "Incrementar masa muscular"
+            unidad = "%"
+            meta_valor = 10
+
+        db.execute(text("""
+            INSERT INTO objetivos_cliente (
+                id_cliente, tipo_objetivo, titulo,
+                valor_objetivo, valor_actual, unidad,
+                estado, porcentaje_completado, fecha_inicio, fecha_limite
+            )
+            VALUES (
+                :cliente, 'objetivo', :titulo,
+                :meta, 0, :unidad,
                 'pendiente', 0,
                 NOW(), DATE_ADD(NOW(), INTERVAL 30 DAY)
             )
-        """)
-        db.execute(query, {"cliente": id_cliente})
+        """), {
+            "cliente": id_cliente,
+            "titulo": titulo_obj,
+            "meta": meta_valor,
+            "unidad": unidad
+        })
+
         db.commit()
 
 
@@ -1101,6 +1281,51 @@ else:
         """
         Genera un plan de entrenamiento usando Gemini AI con timeout configurado.
         """
+
+        def _get_finish_reason(resp) -> Optional[str]:
+            """
+            Intenta extraer finish_reason de la respuesta de Gemini
+            de forma robusta para distintas versiones del cliente.
+            """
+            try:
+                candidates = getattr(resp, "candidates", None)
+                if not candidates:
+                    return None
+                fr = getattr(candidates[0], "finish_reason", None)
+                if fr is None:
+                    return None
+                # Puede ser enum, string o número
+                if hasattr(fr, "name"):
+                    return fr.name
+                return str(fr)
+            except Exception:
+                return None
+
+        def _parse_gemini_json(raw: str) -> Dict[str, Any]:
+            """
+            Intenta parsear JSON de la cadena devuelta por Gemini.
+            - Recorta al primer '{' y último '}'.
+            - Si hay texto extra fuera del JSON, lo ignora.
+            """
+            if not raw or raw.strip() == "":
+                raise ValueError("Gemini devolvió texto vacío al intentar parsear JSON.")
+
+            text = raw.strip()
+
+            # Si hay varios bloques, nos quedamos con el primero que parezca JSON
+            m = re.search(r"\{[\s\S]*\}", text)
+            if m:
+                text = m.group(0)
+
+            # Recortar desde el primer '{' al último '}'
+            start = text.find("{")
+            end = text.rfind("}")
+            if start != -1 and end != -1 and end > start:
+                text = text[start:end + 1]
+
+            # Intento final de parseo
+            return json.loads(text)
+
         if not GEMINI_API_KEY:
             raise RuntimeError("GEMINI_API_KEY no configurada")
 
@@ -1168,6 +1393,7 @@ else:
             print(resp)
             print("======================= END RAW RESPONSE ==========================\n")
 
+            # Obtener texto plano
             raw = _resp_to_text(resp)
 
             print("\n========= RAW TEXT EXTRACTED FROM RESPONSE =========")
@@ -1178,17 +1404,26 @@ else:
                 pf = getattr(resp, "prompt_feedback", None)
                 raise RuntimeError(f"Gemini devolvió vacío. prompt_feedback={pf}")
 
-            # Intentar parsear JSON
-            try:
-                return json.loads(raw)
-            except Exception:
-                # Buscar JSON dentro del texto
-                m = re.search(r"\{[\s\S]*\}", raw)
-                if not m:
-                    raise ValueError(
-                        f"Gemini no devolvió JSON válido. Primeros 400 chars:\n{raw[:400]}..."
+            # 🔍 Revisar finish_reason antes de intentar parsear JSON
+            finish_reason = _get_finish_reason(resp)
+            if finish_reason:
+                print(f"⚠️ DEBUG GEMINI — finish_reason={finish_reason}")
+                # Si se cortó por límite de tokens, NO intentamos parsear
+                if "MAX_TOKENS" in str(finish_reason):
+                    raise RuntimeError(
+                        f"Gemini se detuvo por límite de tokens (finish_reason={finish_reason}). "
+                        f"La rutina quedó incompleta. Prueba con menos días, menos ejercicios "
+                        f"o un modo de respuesta más resumido."
                     )
-                return json.loads(m.group(0))
+                # Si no es STOP, también consideramos la respuesta inválida
+                if "STOP" not in str(finish_reason):
+                    raise RuntimeError(
+                        f"Gemini no terminó correctamente (finish_reason={finish_reason}). "
+                        f"No se intentará parsear el JSON."
+                    )
+
+            # Intentar parsear JSON de forma robusta
+            return _parse_gemini_json(raw)
 
         except Exception as e:
             print("🔴 GEMINI ERROR DETECTADO 🔴")
@@ -1247,18 +1482,27 @@ else:
             print("=== END FALLBACK RAW ===\n")
 
             raw = _resp_to_text(resp)
-            if not raw:
-                raise RuntimeError("Gemini (flash) devolvió vacío.")
+            if not raw or raw.strip() == "":
+                raise RuntimeError("Gemini (fallback) devolvió vacío.")
 
-            try:
-                return json.loads(raw)
-            except Exception:
-                m = re.search(r"\{[\s\S]*\}", raw)
-                if not m:
-                    raise ValueError("Gemini (flash) no devolvió JSON válido.")
-                return json.loads(m.group(0))
+            # Revisar finish_reason también en el fallback
+            finish_reason = _get_finish_reason(resp)
+            if finish_reason:
+                print(f"⚠️ DEBUG GEMINI FALLBACK — finish_reason={finish_reason}")
+                if "MAX_TOKENS" in str(finish_reason):
+                    raise RuntimeError(
+                        f"Gemini fallback se detuvo por límite de tokens (finish_reason={finish_reason}). "
+                        f"La rutina quedó incompleta incluso en el modelo ligero."
+                    )
+                if "STOP" not in str(finish_reason):
+                    raise RuntimeError(
+                        f"Gemini fallback no terminó correctamente (finish_reason={finish_reason})."
+                    )
+
+            return _parse_gemini_json(raw)
 
         except Exception:
+            # Si también falla el fallback, devolvemos el error original
             raise RuntimeError(
                 f"Fallo en _gemini_generate_plan: {type(last_err).__name__}: {str(last_err)} "
                 f"(modelos probados: {tried_models})"
@@ -1300,12 +1544,13 @@ else:
                 raise RuntimeError("OpenAI devolvió respuesta vacía")
 
             try:
-                return json.loads(raw)
+                return extract_json_safe(raw)
             except json.JSONDecodeError:
                 m = re.search(r"\{[\s\S]*\}", raw)
                 if not m:
                     raise ValueError(f"OpenAI no devolvió JSON válido. raw (400): {raw[:400]}...")
-                return json.loads(m.group(0))
+                return extract_json_safe(m.group(0))
+
 
         except Exception as e:
             raise RuntimeError(f"Fallo en _openai_generate_plan: {type(e).__name__}: {str(e)}")
@@ -1695,7 +1940,7 @@ else:
             # 6) CREAR OBJETIVOS Y ALERTAS INICIALES
             # ======================================================
 
-            crear_objetivos_iniciales(db, solicitud.id_cliente, id_rutina)
+            crear_objetivos_iniciales(db, solicitud.id_cliente, id_rutina, base)
             crear_alertas_iniciales(db, solicitud.id_cliente)
 
             # ======================================================
@@ -2003,6 +2248,9 @@ else:
                                                                            "temperature": 0.0})
 
             raw = _resp_to_text(resp)
+            if len(raw) > 20000:
+                raw = raw[:20000]
+
             return {"status": "ok", "raw": raw}
         except Exception as e:
             return {"status": "error", "message": f"{type(e).__name__}: {str(e)}"}

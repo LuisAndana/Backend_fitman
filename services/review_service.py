@@ -1,4 +1,4 @@
-# services/review_service_fixed.py
+# services/review_service.py
 from sqlalchemy.orm import Session
 from sqlalchemy import func, select
 from models.review import Resena
@@ -7,9 +7,8 @@ from schemas.review import ResenaCreate, ResenaUpdate, EstadisticasEntrenador
 from datetime import datetime
 
 
-def crear_resena(db: Session, id_alumno: int, data: ResenaCreate) -> Resena:
+def crear_resena(db: Session, id_alumno: int, data: ResenaCreate) -> dict:
     """Crea una nueva reseña del alumno hacia el entrenador"""
-    # Crear diccionario con solo los campos que vienen en data
     resena_data = {
         "id_entrenador": data.id_entrenador,
         "id_alumno": id_alumno,
@@ -18,7 +17,6 @@ def crear_resena(db: Session, id_alumno: int, data: ResenaCreate) -> Resena:
         "fecha_actualizacion": datetime.utcnow()
     }
 
-    # Agregar campos opcionales solo si vienen en data
     if hasattr(data, 'titulo') and data.titulo is not None:
         resena_data["titulo"] = data.titulo
     if hasattr(data, 'comentario') and data.comentario is not None:
@@ -32,37 +30,35 @@ def crear_resena(db: Session, id_alumno: int, data: ResenaCreate) -> Resena:
     if hasattr(data, 'resultados') and data.resultados is not None:
         resena_data["resultados"] = data.resultados
 
-    # Crear la reseña con solo los campos que tienen valor
     resena = Resena(**resena_data)
-
     db.add(resena)
     db.commit()
     db.refresh(resena)
 
     print(f"[DEBUG] Reseña creada con ID: {resena.id_resena}")
-    return resena
+    return _enriquecer_resena(db, resena)
 
 
-def obtener_resena(db: Session, id_resena: int) -> Resena | None:
+def obtener_resena(db: Session, id_resena: int) -> dict | None:
     """Obtiene una reseña específica"""
     resena = db.query(Resena).filter(Resena.id_resena == id_resena).first()
     if resena:
         print(f"[DEBUG] Reseña encontrada: ID={resena.id_resena}")
+        return _enriquecer_resena(db, resena)
     else:
         print(f"[DEBUG] Reseña con ID={id_resena} no encontrada")
-    return resena
+    return None
 
 
-def actualizar_resena(db: Session, id_resena: int, data: ResenaUpdate) -> Resena | None:
+def actualizar_resena(db: Session, id_resena: int, data: ResenaUpdate) -> dict | None:
     """Actualiza una reseña existente"""
-    resena = obtener_resena(db, id_resena)
+    resena = db.query(Resena).filter(Resena.id_resena == id_resena).first()
     if not resena:
         return None
 
-    # Solo actualizar campos que vienen en el payload
     update_data = data.model_dump(exclude_unset=True)
     for field, value in update_data.items():
-        if value is not None:  # Solo actualizar si el valor no es None
+        if value is not None:
             setattr(resena, field, value)
 
     resena.fecha_actualizacion = datetime.utcnow()
@@ -71,12 +67,12 @@ def actualizar_resena(db: Session, id_resena: int, data: ResenaUpdate) -> Resena
     db.refresh(resena)
 
     print(f"[DEBUG] Reseña {id_resena} actualizada")
-    return resena
+    return _enriquecer_resena(db, resena)
 
 
 def eliminar_resena(db: Session, id_resena: int) -> bool:
     """Elimina una reseña"""
-    resena = obtener_resena(db, id_resena)
+    resena = db.query(Resena).filter(Resena.id_resena == id_resena).first()
     if not resena:
         return False
 
@@ -86,7 +82,7 @@ def eliminar_resena(db: Session, id_resena: int) -> bool:
     return True
 
 
-def obtener_resenas_entrenador(db: Session, id_entrenador: int, limit: int = 10) -> list[Resena]:
+def obtener_resenas_entrenador(db: Session, id_entrenador: int, limit: int = 10) -> list[dict]:
     """Obtiene todas las reseñas de un entrenador"""
     resenas = db.query(Resena) \
         .filter(Resena.id_entrenador == id_entrenador) \
@@ -95,33 +91,42 @@ def obtener_resenas_entrenador(db: Session, id_entrenador: int, limit: int = 10)
         .all()
 
     print(f"[DEBUG] Encontradas {len(resenas)} reseñas para entrenador {id_entrenador}")
-    return resenas
+
+    # ✅ Enriquecer cada reseña con datos del alumno
+    resenas_enriquecidas = [_enriquecer_resena(db, r) for r in resenas]
+    return resenas_enriquecidas
 
 
 def obtener_estadisticas_entrenador(db: Session, id_entrenador: int) -> EstadisticasEntrenador:
     """Calcula estadísticas de calificación de un entrenador"""
-    resenas = obtener_resenas_entrenador(db, id_entrenador, limit=100)
+    resenas = db.query(Resena) \
+        .filter(Resena.id_entrenador == id_entrenador) \
+        .order_by(Resena.fecha_creacion.desc()) \
+        .limit(100) \
+        .all()
 
     if not resenas:
         return EstadisticasEntrenador(
             id_entrenador=id_entrenador,
-            calificacion_promedio=0.0,
+            promedio_calificacion=0.0,
             total_resenas=0,
             resenas_recientes=[]
         )
 
     calificacion_promedio = sum(r.calificacion for r in resenas) / len(resenas)
 
-    # En el esquema original era 'promedio_calificacion', corregir el nombre
+    # ✅ Enriquecer las reseñas recientes
+    resenas_recientes_enriquecidas = [_enriquecer_resena(db, r) for r in resenas[:5]]
+
     return EstadisticasEntrenador(
         id_entrenador=id_entrenador,
-        promedio_calificacion=round(calificacion_promedio, 2),  # Cambio aquí
+        promedio_calificacion=round(calificacion_promedio, 2),
         total_resenas=len(resenas),
-        resenas_recientes=[r for r in resenas[:5]]
+        resenas_recientes=resenas_recientes_enriquecidas
     )
 
 
-def obtener_resenas_por_alumno(db: Session, id_alumno: int, id_entrenador: int) -> Resena | None:
+def obtener_resenas_por_alumno(db: Session, id_alumno: int, id_entrenador: int) -> dict | None:
     """Obtiene la reseña del alumno hacia el entrenador (si existe)"""
     resena = db.query(Resena).filter(
         Resena.id_alumno == id_alumno,
@@ -130,15 +135,46 @@ def obtener_resenas_por_alumno(db: Session, id_alumno: int, id_entrenador: int) 
 
     if resena:
         print(f"[DEBUG] Encontrada reseña del alumno {id_alumno} para entrenador {id_entrenador}")
-    return resena
+        return _enriquecer_resena(db, resena)
+    return None
 
 
-# Funciones adicionales de utilidad
-def obtener_todas_resenas(db: Session, limit: int = 100) -> list[Resena]:
+def _enriquecer_resena(db: Session, resena: Resena) -> dict:
+    """
+    Enriquece una reseña con datos del alumno (nombre, foto)
+    """
+    alumno = db.query(Usuario).filter(Usuario.id_usuario == resena.id_alumno).first()
+
+    resena_dict = {
+        "id_resena": resena.id_resena,
+        "id_entrenador": resena.id_entrenador,
+        "id_alumno": resena.id_alumno,
+        "calificacion": resena.calificacion,
+        "titulo": resena.titulo,
+        "comentario": resena.comentario,
+        "calidad_rutina": resena.calidad_rutina,
+        "comunicacion": resena.comunicacion,
+        "disponibilidad": resena.disponibilidad,
+        "resultados": resena.resultados,
+        "fecha_creacion": resena.fecha_creacion,
+        "fecha_actualizacion": resena.fecha_actualizacion,
+        # ✅ AGREGAR ESTA LÍNEA:
+        "fecha_resena": resena.fecha_creacion,  # ← Para que el frontend lo reciba
+        # ✅ Agregar datos del alumno
+        "nombreAlumno": alumno.nombre if alumno else "Cliente Anónimo",
+        "nombre_alumno": alumno.nombre if alumno else "Cliente Anónimo",
+        "fotoAlumno": alumno.foto_url if alumno else None,
+    }
+
+    return resena_dict
+
+
+def obtener_todas_resenas(db: Session, limit: int = 100) -> list[dict]:
     """Obtiene todas las reseñas del sistema (para debugging)"""
     resenas = db.query(Resena).limit(limit).all()
-    print(f"[DEBUG] Total de reseñas en el sistema: {len(resenas)}")
-    return resenas
+    resenas_enriquecidas = [_enriquecer_resena(db, r) for r in resenas]
+    print(f"[DEBUG] Total de reseñas en el sistema: {len(resenas_enriquecidas)}")
+    return resenas_enriquecidas
 
 
 def contar_resenas_total(db: Session) -> int:

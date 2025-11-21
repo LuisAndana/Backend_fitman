@@ -1,6 +1,5 @@
-# routers/mensajes.py - VERSIÓN SIN AUTENTICACIÓN (SOLO DESARROLLO)
-# ⚠️ ADVERTENCIA: Esta versión NO requiere autenticación
-# Solo usar para desarrollo/testing, NO en producción
+# routers/mensajes.py - VERSIÓN ACTUALIZADA
+# ✅ Agrega endpoint específico para entrenadores
 
 from fastapi import APIRouter, Depends, HTTPException, status, Query
 from sqlalchemy.orm import Session
@@ -16,7 +15,8 @@ from services.message_service import (
     marcar_conversacion_como_leida,
     obtener_conversaciones,
     contar_no_leidos,
-    eliminar_mensaje, obtener_conversacion,
+    eliminar_mensaje,
+    obtener_conversacion,
 )
 
 router = APIRouter(prefix="/mensajes", tags=["mensajes"])
@@ -24,9 +24,9 @@ router = APIRouter(prefix="/mensajes", tags=["mensajes"])
 
 @router.post("", response_model=MensajeOut, status_code=status.HTTP_201_CREATED)
 def enviar_mensaje_endpoint(
-    user_id: int = Query(..., description="ID del usuario remitente"),
-    payload: MensajeCreate = None,
-    db: Session = Depends(get_db),
+        user_id: int = Query(..., description="ID del usuario remitente"),
+        payload: MensajeCreate = None,
+        db: Session = Depends(get_db),
 ):
     if payload is None:
         raise HTTPException(status_code=400, detail="Body del request es requerido")
@@ -47,11 +47,12 @@ def enviar_mensaje_endpoint(
     mensaje = enviar_mensaje(db, user_id, payload)
     return mensaje
 
+
 @router.get("/{id_mensaje}", response_model=MensajeOut)
 def obtener_mensaje_endpoint(
-    id_mensaje: int,
-    user_id: int = Query(..., description="ID del usuario que solicita el mensaje"),
-    db: Session = Depends(get_db),
+        id_mensaje: int,
+        user_id: int = Query(..., description="ID del usuario que solicita el mensaje"),
+        db: Session = Depends(get_db),
 ):
     mensaje = obtener_mensaje(db, id_mensaje)
     if not mensaje:
@@ -69,9 +70,9 @@ def obtener_mensaje_endpoint(
 
 @router.post("/{id_mensaje}/marcar-leido", status_code=status.HTTP_204_NO_CONTENT)
 def marcar_leido_endpoint(
-    id_mensaje: int,
-    user_id: int = Query(..., description="ID del usuario destinatario"),
-    db: Session = Depends(get_db),
+        id_mensaje: int,
+        user_id: int = Query(..., description="ID del usuario destinatario"),
+        db: Session = Depends(get_db),
 ):
     mensaje = obtener_mensaje(db, id_mensaje)
     if not mensaje:
@@ -93,7 +94,7 @@ def obtener_conversacion_endpoint(
         db: Session = Depends(get_db),
 ):
     """
-    🔧 MODIFICADO: Obtiene la conversación entre dos usuarios
+    🔧 Obtiene la conversación entre dos usuarios
 
     Antes requería autenticación, ahora usa user_id como parámetro
     """
@@ -133,64 +134,56 @@ def obtener_conversacion_endpoint(
         mensajes=mensajes[::-1],  # Invertir orden para mostrar cronológicamente
         total=len(mensajes)
     )
-@router.get("/conversacion/{id_otro_usuario}", response_model=MensajesHistorico)
-def obtener_historial_endpoint(
-    id_otro_usuario: int,
-    user_id: int = Query(..., description="ID del usuario actual"),
-    limit: int = Query(50, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-):
-    if user_id == id_otro_usuario:
-        raise HTTPException(status_code=400, detail="No puedes obtener conversación contigo mismo")
-
-    usuario_actual = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
-    if not usuario_actual:
-        raise HTTPException(status_code=404, detail="Usuario actual no encontrado")
-
-    otro_usuario = db.query(Usuario).filter(Usuario.id_usuario == id_otro_usuario).first()
-    if not otro_usuario:
-        raise HTTPException(status_code=404, detail="Otro usuario no encontrado")
-
-    # Marca como leídos
-    marcar_conversacion_como_leida(db, user_id, id_otro_usuario)
-
-    # Obtener mensajes (esta función ya NO existe, se reemplaza)
-    from sqlalchemy import or_, and_, desc
-    from models.message import Mensaje
-
-    mensajes = db.query(Mensaje).filter(
-        or_(
-            and_(Mensaje.id_remitente == user_id, Mensaje.id_destinatario == id_otro_usuario),
-            and_(Mensaje.id_remitente == id_otro_usuario, Mensaje.id_destinatario == user_id),
-        )
-    ).order_by(desc(Mensaje.fecha_envio)).limit(limit).offset(offset).all()
-
-    return MensajesHistorico(
-        mensajes=mensajes[::-1],
-        total=len(mensajes)
-    )
 
 
 @router.get("/mis-conversaciones/lista", response_model=List[ConversacionOut])
 def obtener_conversaciones_endpoint(
-    user_id: int = Query(..., description="ID del usuario"),
-    db: Session = Depends(get_db),
+        user_id: int = Query(..., description="ID del usuario"),
+        db: Session = Depends(get_db),
 ):
+    """
+    ✅ Obtiene todas las conversaciones del usuario (cliente o entrenador)
+    """
+    print(f"🔍 [MIS-CONVERSACIONES] Usuario {user_id} obtiene sus conversaciones")
+
     usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
     if not usuario:
         raise HTTPException(status_code=404, detail="Usuario no encontrado")
 
-    return obtener_conversaciones(db, user_id)
+    conversaciones = obtener_conversaciones(db, user_id)
+    print(f"📊 Total de conversaciones: {len(conversaciones)}")
+
+    return conversaciones
 
 
+@router.get("/mis-conversaciones-entrenador/lista", response_model=List[ConversacionOut])
+def obtener_conversaciones_entrenador_endpoint(
+        user_id: int = Query(..., description="ID del entrenador"),
+        db: Session = Depends(get_db),
+):
+    """
+    ✅ Endpoint específico para entrenadores - Obtiene sus conversaciones
+
+    Este endpoint es exactamente igual a /mis-conversaciones/lista pero
+    existe específicamente para que el frontend entrenador pueda llamarlo
+    """
+    print(f"🔍 [MIS-CONVERSACIONES-ENTRENADOR] Entrenador {user_id} obtiene sus conversaciones")
+
+    usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
+    if not usuario:
+        raise HTTPException(status_code=404, detail="Entrenador no encontrado")
+
+    conversaciones = obtener_conversaciones(db, user_id)
+    print(f"📊 Total de conversaciones del entrenador: {len(conversaciones)}")
+
+    return conversaciones
 
 
 @router.post("/marcar-conversacion-leida/{id_otro_usuario}", status_code=status.HTTP_204_NO_CONTENT)
 def marcar_conversacion_leida_endpoint(
-    id_otro_usuario: int,
-    user_id: int = Query(..., description="ID del usuario actual"),
-    db: Session = Depends(get_db),
+        id_otro_usuario: int,
+        user_id: int = Query(..., description="ID del usuario actual"),
+        db: Session = Depends(get_db),
 ):
     usuario = db.query(Usuario).filter(Usuario.id_usuario == user_id).first()
     if not usuario:
@@ -204,12 +197,11 @@ def marcar_conversacion_leida_endpoint(
     return None
 
 
-
 @router.delete("/{id_mensaje}", status_code=status.HTTP_204_NO_CONTENT)
 def eliminar_mensaje_endpoint(
-    id_mensaje: int,
-    user_id: int = Query(..., description="ID del usuario remitente"),
-    db: Session = Depends(get_db),
+        id_mensaje: int,
+        user_id: int = Query(..., description="ID del usuario remitente"),
+        db: Session = Depends(get_db),
 ):
     mensaje = obtener_mensaje(db, id_mensaje)
     if not mensaje:
@@ -223,6 +215,23 @@ def eliminar_mensaje_endpoint(
 
     eliminar_mensaje(db, id_mensaje)
     return None
+
+
+@router.get("/no-leidos/contar")
+def contar_no_leidos_endpoint(
+        user_id: int = Query(..., description="ID del usuario"),
+        db: Session = Depends(get_db)
+):
+    """
+    ✅ Cuenta los mensajes no leídos del usuario
+    """
+    print(f"📬 [CONTAR-NO-LEIDOS] Usuario {user_id}")
+
+    count = contar_no_leidos(db, user_id)
+    print(f"📊 Mensajes sin leer: {count}")
+
+    return {"no_leidos": count}
+
 
 # ============================================================
 # ENDPOINTS DE PRUEBA ADICIONALES (SOLO PARA DESARROLLO)
@@ -442,12 +451,6 @@ def obtener_estadisticas_mensajes(
             for d in top_destinatarios
         ]
     }
-@router.get("/no-leidos/contar")
-def contar_no_leidos_endpoint(
-    user_id: int = Query(..., description="ID del usuario"),
-    db: Session = Depends(get_db)
-):
-    return {"no_leidos": contar_no_leidos(db, user_id)}
 
 
 def _usuario_conversacion_usuario_conversacion(u: Usuario) -> dict:
@@ -461,5 +464,3 @@ def _usuario_conversacion_usuario_conversacion(u: Usuario) -> dict:
         "email": u.email,
         "rol": rol_value
     }
-
-

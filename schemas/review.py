@@ -38,6 +38,10 @@ class ResenaOut(BaseModel):
     resultados: Optional[int] = None
     fecha_creacion: datetime
     fecha_actualizacion: datetime
+    # ✅ AGREGADO: Nombre del alumno
+    nombreAlumno: Optional[str] = None
+    nombre_alumno: Optional[str] = None
+    fotoAlumno: Optional[str] = None
 
     class Config:
         from_attributes = True

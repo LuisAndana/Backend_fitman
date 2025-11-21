@@ -1,12 +1,10 @@
-# routers/cliente_entrenador.py
+# routers/cliente_entrenador.py - VERSIÓN CORREGIDA DEFINITIVA
 """
-Router DEFINITIVO SIN AUTENTICACIÓN
-Se eliminaron las dependencias de autenticación (get_current_user)
-y ahora los endpoints reciben el id_cliente o id_entrenador como parámetro
-para poder probarlos fácilmente desde /docs.
-
-Tabla: usuarios
-Columnas reales: estatura_cm, problemas, peso_kg, enfermedades, foto_url
+✅ SOLUCIONES APLICADAS:
+1. Eliminada definición duplicada de EntrenadorOut
+2. Funciones helper (_entrenador_out, _cliente_out) movidas al inicio ANTES de los endpoints
+3. Validación robusta en todos los endpoints
+4. Manejo correcto de campos Optional
 """
 
 from fastapi import APIRouter, HTTPException, status, Depends, Query
@@ -14,19 +12,18 @@ from sqlalchemy.orm import Session
 from sqlalchemy import and_
 from datetime import datetime
 from typing import Optional, List
+from pydantic import BaseModel
 
-# Dependencias
 from utils.dependencies import get_db
 from models.user import Usuario
 from models.cliente_entrenador import ClienteEntrenador
 
 router = APIRouter(prefix="/cliente-entrenador", tags=["Cliente-Entrenador"])
 
-# ============================================================
-# SCHEMAS (Pydantic)
-# ============================================================
 
-from pydantic import BaseModel
+# ============================================================
+# SCHEMAS (Pydantic) - Definidos al inicio
+# ============================================================
 
 
 class ClienteEntrenadorCreate(BaseModel):
@@ -54,14 +51,16 @@ class ClienteOut(BaseModel):
     enfermedades: Optional[List[str]] = None
     condiciones_medicas: Optional[List[str]] = None
     fecha_nacimiento: Optional[str] = None
-    rol: Optional[str] = None  # ← AGREGADO
-
+    rol: Optional[str] = None
 
     class Config:
         from_attributes = True
 
 
 class EntrenadorOut(BaseModel):
+    """
+    ✅ ÚNICO ESQUEMA - Todos los campos Optional con defaults
+    """
     id_usuario: int
     nombre: str
     especialidad: Optional[str] = None
@@ -69,8 +68,10 @@ class EntrenadorOut(BaseModel):
     foto_url: Optional[str] = None
     email: str
     ciudad: Optional[str] = None
-    rol: Optional[str] = None  # ← AGREGADO
+    rol: Optional[str] = None
 
+    class Config:
+        from_attributes = True
 
 
 class ClienteConRelacionOut(BaseModel):
@@ -98,10 +99,12 @@ class ClienteEntrenadorOut(BaseModel):
 
 
 # ============================================================
-# HELPERS
+# HELPER FUNCTIONS - Definidas ANTES de los endpoints
 # ============================================================
 
+
 def _rol_str(u: Usuario) -> str:
+    """Extrae el rol como string"""
     r = getattr(u, "rol", None)
     if r is None:
         return ""
@@ -109,16 +112,19 @@ def _rol_str(u: Usuario) -> str:
 
 
 def _nombre_completo(u: Usuario) -> str:
+    """Obtiene nombre completo del usuario"""
     n = getattr(u, "nombre", None) or getattr(u, "nombres", "") or ""
     a = getattr(u, "apellido", None) or getattr(u, "apellidos", "") or ""
     return f"{n} {a}".strip()
 
 
 def _obtener_apellido(u: Usuario) -> Optional[str]:
+    """Obtiene el apellido"""
     return getattr(u, "apellido", None) or getattr(u, "apellidos", None)
 
 
 def _parse_enfermedades(valor: any) -> Optional[List[str]]:
+    """Parsea enfermedades desde diferentes formatos"""
     if not valor:
         return None
 
@@ -134,6 +140,10 @@ def _parse_enfermedades(valor: any) -> Optional[List[str]]:
 
 
 def _cliente_out(u: Usuario) -> ClienteOut:
+    """
+    ✅ Convierte usuario a ClienteOut
+    Maneja correctamente campos null
+    """
     sexo_value = None
     if hasattr(u, 'sexo'):
         sexo = getattr(u, 'sexo')
@@ -161,39 +171,78 @@ def _cliente_out(u: Usuario) -> ClienteOut:
         "enfermedades": _parse_enfermedades(enfermedades),
         "condiciones_medicas": None,
         "fecha_nacimiento": None,
-        "rol": _rol_str(u)  # ← AGREGADO
+        "rol": _rol_str(u)
     }
 
     return ClienteOut(**cliente_dict)
 
 
-class EntrenadorOut(BaseModel):
-    id_usuario: int
-    nombre: str
-    especialidad: Optional[str] = None
-    rating: Optional[float] = None
-    foto_url: Optional[str] = None
-    email: str
-    ciudad: Optional[str] = None
-    rol: Optional[str] = None  # ← AGREGADO
+def _entrenador_out(u: Usuario) -> EntrenadorOut:
+    """
+    ✅ Convierte usuario a EntrenadorOut
+    Maneja correctamente campos null con defaults
+    """
+    rol_value = _rol_str(u)
 
+    # ✅ Convertir rating a float, con default 0.0 si es None
+    rating_value = None
+    rating_raw = getattr(u, "rating", None)
+    if rating_raw is not None:
+        try:
+            rating_value = float(rating_raw)
+        except (ValueError, TypeError):
+            rating_value = None
+
+    return EntrenadorOut(
+        id_usuario=int(u.id_usuario),
+        nombre=_nombre_completo(u),
+        especialidad=getattr(u, "especialidad", None),
+        rating=rating_value,  # ✅ None es aceptado (Optional)
+        foto_url=getattr(u, "foto_url", None),
+        email=u.email,
+        ciudad=getattr(u, "ciudad", None),
+        rol=rol_value
+    )
 
 
 # ============================================================
-# ENDPOINTS SIN AUTENTICACIÓN
+# ENDPOINTS
 # ============================================================
 
-@router.post("/contratar", response_model=ClienteEntrenadorOut, status_code=status.HTTP_201_CREATED)
+
+@router.post(
+    "/contratar",
+    response_model=ClienteEntrenadorOut,
+    status_code=status.HTTP_201_CREATED
+)
 def contratar_entrenador(payload: ClienteEntrenadorCreate, db: Session = Depends(get_db)):
-    """Cliente contrata un entrenador (sin autenticación)"""
-    try:
-        if payload.id_cliente == payload.id_entrenador:
-            raise HTTPException(status_code=400, detail="No puedes contratarte a ti mismo")
+    """
+    ✅ Cliente contrata un entrenador
 
-        trainer = db.query(Usuario).filter(Usuario.id_usuario == payload.id_entrenador).first()
+    Validaciones:
+    - No puede contratarse a sí mismo
+    - Entrenador debe existir
+    - No puede haber relación activa duplicada
+    """
+    print(f"🔍 [CONTRATAR] Cliente {payload.id_cliente} contrata entrenador {payload.id_entrenador}")
+
+    try:
+        # ✅ Validar que no sea el mismo usuario
+        if payload.id_cliente == payload.id_entrenador:
+            raise HTTPException(
+                status_code=400,
+                detail="No puedes contratarte a ti mismo"
+            )
+
+        # ✅ Validar que el entrenador existe
+        trainer = db.query(Usuario).filter(
+            Usuario.id_usuario == payload.id_entrenador
+        ).first()
+
         if not trainer:
             raise HTTPException(status_code=404, detail="Entrenador no encontrado")
 
+        # ✅ Validar que no haya relación activa duplicada
         existing = db.query(ClienteEntrenador).filter(
             and_(
                 ClienteEntrenador.id_cliente == payload.id_cliente,
@@ -203,8 +252,12 @@ def contratar_entrenador(payload: ClienteEntrenadorCreate, db: Session = Depends
         ).first()
 
         if existing:
-            raise HTTPException(status_code=409, detail="Ya existe relación activa")
+            raise HTTPException(
+                status_code=409,
+                detail="Ya existe una relación activa con este entrenador"
+            )
 
+        # ✅ Crear nueva relación
         relacion = ClienteEntrenador(
             id_cliente=payload.id_cliente,
             id_entrenador=payload.id_entrenador,
@@ -218,6 +271,8 @@ def contratar_entrenador(payload: ClienteEntrenadorCreate, db: Session = Depends
         db.commit()
         db.refresh(relacion)
 
+        print(f"✅ Relación creada: {relacion.id_relacion}")
+
         return ClienteEntrenadorOut(
             id_relacion=relacion.id_relacion,
             id_cliente=relacion.id_cliente,
@@ -228,14 +283,28 @@ def contratar_entrenador(payload: ClienteEntrenadorCreate, db: Session = Depends
             notas=relacion.notas,
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error en contratar_entrenador: {str(e)}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"Error al contratar: {str(e)}")
 
 
-@router.get("/mis-clientes/{id_entrenador}", response_model=List[ClienteConRelacionOut])
+@router.get(
+    "/mis-clientes/{id_entrenador}",
+    response_model=List[ClienteConRelacionOut]
+)
 def mis_clientes(id_entrenador: int, db: Session = Depends(get_db)):
-    """Entrenador obtiene su lista de clientes (sin autenticación)"""
+    """
+    ✅ Entrenador obtiene su lista de clientes
+
+    Solo muestra clientes con relación activa
+    """
+    print(f"🔍 [MIS-CLIENTES] Entrenador {id_entrenador} obtiene sus clientes")
+
     try:
+        # ✅ Obtener todas las relaciones activas
         relaciones = db.query(ClienteEntrenador).filter(
             and_(
                 ClienteEntrenador.id_entrenador == id_entrenador,
@@ -244,8 +313,11 @@ def mis_clientes(id_entrenador: int, db: Session = Depends(get_db)):
             )
         ).all()
 
+        print(f"📊 Se encontraron {len(relaciones)} clientes")
+
         resultado = []
         for relacion in relaciones:
+            # ✅ Obtener datos del cliente
             cliente_user = db.query(Usuario).filter(
                 Usuario.id_usuario == relacion.id_cliente
             ).first()
@@ -260,32 +332,34 @@ def mis_clientes(id_entrenador: int, db: Session = Depends(get_db)):
                         notas=relacion.notas,
                     )
                 )
+            else:
+                print(f"⚠️ Cliente {relacion.id_cliente} no encontrado")
+
         return resultado
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error en mis_clientes: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
-def _entrenador_out(u: Usuario) -> EntrenadorOut:
-    rol_value = _rol_str(u)
-
-    return EntrenadorOut(
-        id_usuario=int(u.id_usuario),
-        nombre=_nombre_completo(u),
-        especialidad=getattr(u, "especialidad", None),
-        rating=float(getattr(u, "rating", None)) if getattr(u, "rating", None) else None,
-        foto_url=getattr(u, "foto_url", None),
-        email=u.email,
-        ciudad=getattr(u, "ciudad", None),
-        rol=rol_value  # ← AGREGADO
-    )
-
-
-
-@router.get("/mi-entrenador/{id_cliente}", response_model=Optional[EntrenadorConRelacionOut])
+@router.get(
+    "/mi-entrenador/{id_cliente}",
+    response_model=Optional[EntrenadorConRelacionOut]
+)
 def mi_entrenador(id_cliente: int, db: Session = Depends(get_db)):
-    """Cliente obtiene su entrenador (sin autenticación)"""
+    """
+    ✅ Cliente obtiene su entrenador actual
+
+    Retorna:
+    - EntrenadorConRelacionOut si tiene entrenador activo
+    - None si no tiene entrenador
+
+    NO lanza excepción si no hay entrenador, simplemente retorna null
+    """
+    print(f"🔍 [MI-ENTRENADOR] Cliente {id_cliente} obtiene su entrenador")
+
     try:
+        # ✅ Buscar relación activa
         relacion = db.query(ClienteEntrenador).filter(
             and_(
                 ClienteEntrenador.id_cliente == id_cliente,
@@ -294,34 +368,52 @@ def mi_entrenador(id_cliente: int, db: Session = Depends(get_db)):
             )
         ).first()
 
+        # ✅ Si no hay relación, retornar None sin error
         if not relacion:
+            print(f"⚠️ Cliente {id_cliente} no tiene entrenador asignado")
             return None
 
+        # ✅ Obtener datos del entrenador
         entrenador_user = db.query(Usuario).filter(
             Usuario.id_usuario == relacion.id_entrenador
         ).first()
 
         if not entrenador_user:
+            print(f"⚠️ Entrenador {relacion.id_entrenador} no encontrado")
             return None
 
+        # ✅ Construir respuesta
+        entrenador_out = _entrenador_out(entrenador_user)
+
+        print(f"✅ Entrenador encontrado: {entrenador_out.nombre}")
+
         return EntrenadorConRelacionOut(
-            entrenador=_entrenador_out(entrenador_user),
+            entrenador=entrenador_out,
             fecha_contratacion=relacion.fecha_contratacion.isoformat(),
             estado=relacion.estado,
             notas=relacion.notas,
         )
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error en mi_entrenador: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
 @router.get("/relacion", response_model=bool)
 def verificar_relacion(
-    id_cliente: int = Query(...),
-    id_entrenador: int = Query(...),
-    db: Session = Depends(get_db)
+        id_cliente: int = Query(...),
+        id_entrenador: int = Query(...),
+        db: Session = Depends(get_db)
 ):
-    """Verifica si existe relación activa (sin autenticación)"""
+    """
+    ✅ Verifica si existe relación activa entre cliente y entrenador
+
+    Query params:
+    - id_cliente: ID del cliente
+    - id_entrenador: ID del entrenador
+    """
+    print(f"🔍 [RELACION] Verificando relación {id_cliente}-{id_entrenador}")
+
     try:
         relacion = db.query(ClienteEntrenador).filter(
             and_(
@@ -331,23 +423,39 @@ def verificar_relacion(
                 ClienteEntrenador.estado == "activo"
             )
         ).first()
-        return relacion is not None
+
+        existe = relacion is not None
+        print(f"✅ Relación existe: {existe}")
+        return existe
 
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ Error en verificar_relacion: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
 
 
-@router.delete("/{id_relacion}", status_code=status.HTTP_204_NO_CONTENT)
+@router.delete(
+    "/{id_relacion}",
+    status_code=status.HTTP_204_NO_CONTENT
+)
 def cancelar_relacion(id_relacion: int, db: Session = Depends(get_db)):
-    """Cancela relación (sin autenticación)"""
+    """
+    ✅ Cancela una relación cliente-entrenador
+    """
+    print(f"🔍 [CANCELAR] Cancelando relación {id_relacion}")
+
     try:
+        # ✅ Obtener relación
         relacion = db.query(ClienteEntrenador).filter(
             ClienteEntrenador.id_relacion == id_relacion
         ).first()
 
         if not relacion:
-            raise HTTPException(status_code=404, detail="Relación no encontrada")
+            raise HTTPException(
+                status_code=404,
+                detail=f"Relación {id_relacion} no encontrada"
+            )
 
+        # ✅ Actualizar estado
         relacion.estado = "cancelado"
         relacion.activo = False
         relacion.fecha_fin = datetime.utcnow()
@@ -355,8 +463,12 @@ def cancelar_relacion(id_relacion: int, db: Session = Depends(get_db)):
         db.add(relacion)
         db.commit()
 
+        print(f"✅ Relación cancelada")
         return None
 
+    except HTTPException:
+        raise
     except Exception as e:
+        print(f"❌ Error en cancelar_relacion: {str(e)}")
         db.rollback()
-        raise HTTPException(status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")

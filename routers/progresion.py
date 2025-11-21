@@ -63,6 +63,7 @@ class HistorialProgreso(BaseModel):
 class AlertaProgreso(BaseModel):
     """Alerta de progreso o estancamiento"""
     id_alerta: int
+    id_ejercicio: Optional[int] = None
     tipo_alerta: str  # "estancamiento", "rutina_expira", "sin_rutina", "record_personal"
     titulo: str
     mensaje: str
@@ -543,6 +544,7 @@ def obtener_alertas_cliente(id_cliente: int):
         cur.execute("""
             SELECT 
                 id_alerta,
+                id_ejercicio,
                 tipo_alerta,
                 prioridad,
                 titulo,
@@ -1149,54 +1151,35 @@ def atender_alerta(id_alerta: int):
             cur.close()
             cn.close()
 
+
 @router.put("/alertas/{id_alerta}/actualizar-estado")
-def actualizar_estado_alerta(id_alerta: int, datos: dict):
-    """
-    Actualiza el estado de una alerta (pendiente, vista, atendida)
-    y puede guardar la acción realizada por el entrenador.
-    """
+def actualizar_estado_alerta(id_alerta: int, accion: str = Query(None)):
     cn = None
     try:
         cn = get_connection()
-        cur = cn.cursor(dictionary=True)
+        cur = cn.cursor()
 
-        # Verificar que la alerta existe
-        cur.execute("""
-            SELECT id_alerta FROM alertas_progresion
-            WHERE id_alerta = %s
-        """, (id_alerta,))
-        alerta = cur.fetchone()
-
-        if not alerta:
+        cur.execute("""SELECT id_alerta FROM alertas_progresion WHERE id_alerta = %s""", (id_alerta,))
+        if not cur.fetchone():
             raise HTTPException(404, "Alerta no encontrada")
 
-        # Obtener acción
-        accion = datos.get("accion", "").strip()
-
-        # Determinar nuevo estado
         nuevo_estado = "atendida" if accion else "vista"
 
-        # Actualizar alerta
         cur.execute("""
             UPDATE alertas_progresion
-            SET estado = %s,
-                accion_realizada = %s
+            SET estado = %s, accion_realizada = %s
             WHERE id_alerta = %s
-        """, (nuevo_estado, accion, id_alerta))
+        """, (nuevo_estado, accion or "", id_alerta))
 
         cn.commit()
 
-        return {
-            "success": True,
-            "mensaje": f"Alerta actualizada correctamente: {nuevo_estado}",
-            "estado": nuevo_estado
-        }
+        return {"success": True, "mensaje": f"Alerta actualizada: {nuevo_estado}", "estado": nuevo_estado}
 
     except HTTPException:
         raise
     except Exception as e:
-        print("❌ Error al actualizar alerta:", e)
-        raise HTTPException(500, f"Error al actualizar alerta: {str(e)}")
+        if cn: cn.rollback()
+        raise HTTPException(500, f"Error: {str(e)}")
     finally:
         if cn and cn.is_connected():
             cur.close()
@@ -1293,7 +1276,7 @@ def generar_alertas_progresion_periodica(db: Session):
             e.nombre AS nombre_ejercicio,
             MAX(he.fecha_sesion) AS ultima_sesion,
             MAX(he.peso_kg) AS ultimo_peso
-        FROM historial_ejercicio he
+        FROM progreso_ejercicios he
         INNER JOIN ejercicios e ON e.id_ejercicio = he.id_ejercicio
         GROUP BY he.id_cliente, he.id_ejercicio;
     """)
@@ -1363,24 +1346,60 @@ def alertas_periodicas(db: Session = Depends(get_db)):
 @router.post("/alertas/generar-automatico/{id_cliente}")
 def generar_alertas_auto(id_cliente: int, db: Session = Depends(get_db)):
     """
-    Genera alertas cada 2-4 semanas basado en el progreso real del cliente.
+    ✅ Genera alertas SOLO para ejercicios de la RUTINA ACTIVA actual
+    NO para ejercicios de rutinas antiguas
     """
 
-    # 💾 1. Obtener ejercicios con progreso
+    print(f"\n🔥 GENERANDO ALERTAS PARA CLIENTE {id_cliente} - RUTINA ACTIVA SOLAMENTE")
+
+    # 1️⃣ PRIMERO: Obtener la rutina ACTIVA actual del cliente
+    rutina_activa = db.execute(text("""
+        SELECT id_historial, id_rutina, nombre_rutina, fecha_fin
+        FROM historial_rutinas
+        WHERE id_cliente = :cliente
+        AND estado = 'activa'
+        AND fecha_fin > NOW()
+        ORDER BY fecha_inicio DESC
+        LIMIT 1
+    """), {"cliente": id_cliente}).fetchone()
+
+    if not rutina_activa:
+        print(f"⚠️ No hay rutina activa para cliente {id_cliente}")
+        return {
+            "success": False,
+            "mensaje": "No hay rutina activa para generar alertas",
+            "alertas_generadas": 0
+        }
+
+    id_historial = rutina_activa[0]
+    id_rutina = rutina_activa[1]
+    nombre_rutina = rutina_activa[2]
+
+    print(f"✅ Rutina activa encontrada: {nombre_rutina} (ID: {id_rutina})")
+
+    # 2️⃣ SEGUNDO: Obtener SOLO los ejercicios de esta rutina
     query = text("""
         SELECT 
-            he.id_ejercicio,
+            hre.id_ejercicio,
             e.nombre,
-            MAX(he.fecha_sesion) AS ultima_sesion,
-            MAX(he.peso_kg) AS peso_actual,
-            MIN(he.peso_kg) AS peso_inicial
-        FROM historial_ejercicios he
-        INNER JOIN ejercicios e ON he.id_ejercicio = e.id_ejercicio
-        WHERE he.id_cliente = :cliente
-        GROUP BY he.id_ejercicio
+            MAX(pe.fecha_sesion) AS ultima_sesion,
+            MAX(pe.peso_kg) AS peso_actual,
+            MIN(pe.peso_kg) AS peso_inicial
+        FROM historial_rutina_ejercicios hre
+        INNER JOIN ejercicios e ON hre.id_ejercicio = e.id_ejercicio
+        LEFT JOIN progreso_ejercicios pe ON pe.id_ejercicio = hre.id_ejercicio 
+            AND pe.id_cliente = :cliente
+            AND pe.id_historial = :historial
+        WHERE hre.id_historial = :historial
+        GROUP BY hre.id_ejercicio, e.nombre
     """)
 
-    registros = db.execute(query, {"cliente": id_cliente}).fetchall()
+    registros = db.execute(query, {
+        "cliente": id_cliente,
+        "historial": id_historial
+    }).fetchall()
+
+    print(f"📊 Ejercicios en rutina actual: {len(registros)}")
 
     nuevas_alertas = 0
 
@@ -1391,17 +1410,32 @@ def generar_alertas_auto(id_cliente: int, db: Session = Depends(get_db)):
         peso_actual = r[3]
         peso_inicial = r[4]
 
+        # Si NO tiene progreso en esta rutina, saltar
         if not ultima:
+            print(f"⏭️  {nombre} - Sin progreso aún en esta rutina (es normal)")
             continue
 
+        # 🕒 Convertir fecha correctamente
+        if isinstance(ultima, datetime):
+            ultima_dt = ultima
+        else:
+            ultima_str = str(ultima).replace("T", " ")
+            try:
+                ultima_dt = datetime.fromisoformat(ultima_str)
+            except:
+                ultima_dt = datetime.strptime(ultima_str, "%Y-%m-%d %H:%M:%S")
+
         # 🧮 Calcular días desde última sesión
-        ultima_dt = datetime.strptime(str(ultima), "%Y-%m-%d %H:%M:%S")
         dias = (datetime.now() - ultima_dt).days
 
-        if dias < 14:
-            continue  # No ha pasado el periodo mínimo
+        print(f"🔍 {nombre}: {dias} días desde última sesión")
 
-        # Si está entre 14-27 días → prioridad media
+        # 🔥 Para alertas: mínimo 14 días sin progreso
+        if dias < 14:
+            print(f"   ✅ Progreso reciente (solo {dias} días)")
+            continue
+
+        # ⚠️ Determinar prioridad y mensaje
         if 14 <= dias <= 27:
             prioridad = "media"
             mensaje = (
@@ -1415,29 +1449,69 @@ def generar_alertas_auto(id_cliente: int, db: Session = Depends(get_db)):
                 "Es importante retomar o ajustar la carga."
             )
 
-        # Si el peso lleva igual mucho tiempo → estancamiento
+        # 📌 Estancamiento detectado
         if peso_actual == peso_inicial and dias >= 21:
             prioridad = "alta"
             mensaje = (
-                f"No has aumentado peso en '{nombre}' desde hace más de {dias} días. "
-                "Probable estancamiento detectado."
+                f"No has aumentado el peso en '{nombre}' durante más de {dias} días. "
+                "Podría existir estancamiento. Considera ajustar la carga."
             )
 
-        # 📌 Guardar alerta
+        # 📝 Insertar alerta
+        print(f"⚠️  Creando alerta [{prioridad}] para {nombre}")
+
         db.execute(text("""
             INSERT INTO alertas_progresion
-            (id_cliente, tipo_alerta, prioridad, titulo, mensaje, id_ejercicio)
-            VALUES (:c, 'progresion', :p, :t, :m, :e)
+            (id_cliente, tipo_alerta, prioridad, titulo, mensaje, id_ejercicio, 
+             fecha_generacion, estado)
+            VALUES (:c, 'progresion', :p, :t, :m, :e, NOW(), 'pendiente')
         """), {
             "c": id_cliente,
             "p": prioridad,
-            "t": f"Progresión para {nombre}",
+            "t": f"Progresión detectada en {nombre}",
             "m": mensaje,
             "e": id_ejercicio
         })
 
         nuevas_alertas += 1
 
+    # ✅ COMMIT - Guardar en BD
     db.commit()
 
-    return {"alertas_generadas": nuevas_alertas}
+    print(f"✅ {nuevas_alertas} alertas generadas para rutina actual\n")
+
+    return {
+        "success": True,
+        "mensaje": f"Se generaron {nuevas_alertas} alertas para la rutina actual",
+        "alertas_generadas": nuevas_alertas,
+        "rutina": nombre_rutina
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
